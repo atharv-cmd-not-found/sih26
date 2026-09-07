@@ -1,0 +1,6 @@
+python < 3.12.x
+torch
+torchvision
+numpy<2.0.0
+matplotlib
+pyyaml
