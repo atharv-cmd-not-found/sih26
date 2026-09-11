@@ -1,103 +1,170 @@
+import os
 import sys
 import time
+import math
+import warnings
 import queue
+import traceback
 import cv2
 import numpy as np
 import torch
+
+warnings.filterwarnings("ignore")
+os.environ["PYTHONWARNINGS"] = "ignore"
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
+
 import carla
+import spconv.pytorch as spconv
+from models.spconv_unet import SpConvUNet
 
-from models.native_backbone import NativeVoxelBackbone
-from engine.clipmap_engine import FoveatedClipmapEngine
+CHECKPOINT_PATH = r"checkpoints\spconv_semantickitti_best.pth"
 
-NUM_POINTS = 16384
+# High-contrast BGR color palette
+# 0: Background/Noise (Dark Slate Gray)
+# 1: Vehicles (Bright Dodger Blue)
+# 2: Pedestrians/Bicycles (Vivid Red)
+# 3: Drivable Road (Forest Green)
+# 4: Static Obstacles/Barriers (Bright Amber/Orange)
+# 5: Curbs & Median Dividers (Cyan)
+COLOR_PALETTE = {
+    0: (40, 40, 40),
+    1: (255, 120, 0),
+    2: (0, 0, 255),
+    3: (34, 139, 34),
+    4: (0, 140, 255),
+    5: (255, 255, 0),
+}
 
-class UltraFastCarlaPerception:
-    def __init__(self, device="cuda"):
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        print(f"[+] Initializing Perception on: {torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU'}")
+def lidar_callback(sensor_data, data_queue):
+    raw_data = np.frombuffer(sensor_data.raw_data, dtype=np.dtype('f4'))
+    points = np.reshape(raw_data, (int(raw_data.shape[0] / 4), 4))
+    data_queue.put(points)
 
-        # 1. Model Setup in pure Eager FP16 mode (avoids Windows Triton compilation crash)
-        self.model = NativeVoxelBackbone(in_channels=4, num_classes=5).to(self.device).eval()
-        ckpt = "./checkpoints/native_model_best.pth"
-        try:
-            self.model.load_state_dict(torch.load(ckpt, map_location=self.device, weights_only=True))
-            print("[+] Checkpoint loaded successfully.")
-        except Exception:
-            print("[!] Checkpoint missing; running heuristic fallback.")
+def update_spectator_follow_cam(spectator, vehicle):
+    """Smooth third-person chase camera locked to ego vehicle."""
+    transform = vehicle.get_transform()
+    yaw_rad = math.radians(transform.rotation.yaw)
+    cam_x = transform.location.x - 7.5 * math.cos(yaw_rad)
+    cam_y = transform.location.y - 7.5 * math.sin(yaw_rad)
+    cam_z = transform.location.z + 3.8
+    spectator.set_transform(
+        carla.Transform(
+            carla.Location(x=cam_x, y=cam_y, z=cam_z),
+            carla.Rotation(pitch=-18.0, yaw=transform.rotation.yaw, roll=0.0)
+        )
+    )
 
-        self.clipmap_engine = FoveatedClipmapEngine(device=self.device)
-        self.point_buffer = []
+def extract_curbs_and_obstacles(xyz, preds, z_ground_ref=-1.85):
+    """
+    Fuses deep semantic predictions with geometric step-height offsets
+    to sharply classify road, curbs/dividers, and vehicle bodies.
+    """
+    labels = preds.copy()
+    h_above_ground = xyz[:, 2] - z_ground_ref
 
-    @torch.inference_mode()
-    def process_raw_bytes(self, raw_bytes):
-        t0 = time.perf_counter()
+    # 1. Flat Road Surface (-12 cm to +6 cm around ground)
+    road_mask = (h_above_ground >= -0.12) & (h_above_ground < 0.06)
+    labels[road_mask] = 3
 
-        # 2. Transfer raw bytes directly to PyTorch GPU tensor without non-writable buffer warning
-        flat_tensor = torch.frombuffer(bytearray(raw_bytes), dtype=torch.float32)
-        points_gpu = flat_tensor.view(-1, 4).to(self.device, non_blocking=True).clone()
-        
-        # Coordinate conversion: Unreal (X-fwd, Y-right, Z-up) to ISO 8855 (X-fwd, Y-left, Z-up)
-        points_gpu[:, 1] = -points_gpu[:, 1]
+    # 2. Curbs, Sidewalk Edges, and Median Dividers (6 cm to 45 cm above ground)
+    divider_mask = (h_above_ground >= 0.06) & (h_above_ground <= 0.45)
+    labels[divider_mask] = 5
 
-        # Accumulate up to 3 frames in VRAM
-        self.point_buffer.append(points_gpu)
-        if len(self.point_buffer) > 3:
-            self.point_buffer.pop(0)
+    # 3. Vehicles and Static Obstacles (45 cm to 2.3 m above ground)
+    raised_mask = (h_above_ground > 0.45) & (h_above_ground <= 2.30)
+    # Retain dynamic class if the model recognized a vehicle/pedestrian
+    labels[raised_mask & (labels == 1)] = 1
+    labels[raised_mask & (labels == 2)] = 2
+    labels[raised_mask & (labels != 1) & (labels != 2)] = 4
 
-        accumulated_pts = torch.cat(self.point_buffer, dim=0)
+    return labels
 
-        # 3. GPU-side distance partitioning and subsampling via torch.randperm
-        xy_dist = torch.norm(accumulated_pts[:, :2], dim=1)
-        near_indices = torch.nonzero(xy_dist <= 20.0).squeeze(-1)
-        far_indices = torch.nonzero(xy_dist > 20.0).squeeze(-1)
+def render_bev_hud(points, labels, canvas_size=800, range_m=40.0):
+    hud = np.zeros((canvas_size, canvas_size, 3), dtype=np.uint8)
+    center = canvas_size // 2
 
-        half_target = NUM_POINTS // 2
-        selected = []
+    # Metric distance rings
+    for dist in [5, 10, 20, 30]:
+        radius_px = int((dist / range_m) * (canvas_size // 2))
+        cv2.circle(hud, (center, center), radius_px, (45, 45, 45), 1)
+        cv2.putText(hud, f"{dist}m", (center + 5, center - radius_px + 12),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.35, (120, 120, 120), 1)
 
-        if len(near_indices) > half_target:
-            perm = torch.randperm(len(near_indices), device=self.device)[:half_target]
-            selected.append(near_indices[perm])
-        else:
-            selected.append(near_indices)
+    cv2.line(hud, (center, 0), (center, canvas_size), (30, 30, 30), 1)
+    cv2.line(hud, (0, center), (canvas_size, center), (30, 30, 30), 1)
 
-        rem = NUM_POINTS - sum(len(x) for x in selected)
-        if len(far_indices) > rem and rem > 0:
-            perm = torch.randperm(len(far_indices), device=self.device)[:rem]
-            selected.append(far_indices[perm])
-        elif len(far_indices) > 0 and rem > 0:
-            selected.append(far_indices[torch.randint(0, len(far_indices), (rem,), device=self.device)])
+    x = points[:, 0]
+    y = points[:, 1]
+    mask = (np.abs(x) < range_m) & (np.abs(y) < range_m)
 
-        sampled_scan = accumulated_pts[torch.cat(selected)]
+    x_val = x[mask]
+    y_val = y[mask]
+    labels_val = labels[mask]
 
-        # 4. Pure FP16 Autocast Inference (Low latency on RTX 3050 Tensor Cores)
-        model_in = sampled_scan.transpose(0, 1).unsqueeze(0)  # (1, 4, N)
-        with torch.amp.autocast(self.device.type):
-            logits = self.model(model_in)
-            pred_classes = torch.argmax(logits[0], dim=0)
+    # Coordinate mapping: Forward X -> -Y (up on screen), Left Y -> -X (left on screen)
+    px = ((y_val / range_m + 1.0) * 0.5 * (canvas_size - 1)).astype(np.int32)
+    py = (((-x_val) / range_m + 1.0) * 0.5 * (canvas_size - 1)).astype(np.int32)
+    px = np.clip(px, 0, canvas_size - 1)
+    py = np.clip(py, 0, canvas_size - 1)
 
-            # Heuristic assignment for surface extraction across full cloud
-            full_classes = torch.zeros(accumulated_pts.shape[0], dtype=torch.long, device=self.device)
-            full_classes[accumulated_pts[:, 2] < -1.2] = 1
-            full_classes[accumulated_pts[:, 2] >= -1.0] = 3
+    # 1. Base Layer: Drivable Road (single-pixel splats)
+    road_mask = (labels_val == 3)
+    if np.any(road_mask):
+        hud[py[road_mask], px[road_mask]] = COLOR_PALETTE[3]
 
-            # Compute only Band 0 (Near: 20m) and Band 2 (Far: 120m)
-            grids = self.clipmap_engine(accumulated_pts[:, :3], full_classes, active_bands=(0, 2))
+    # 2. Curbs & Median Dividers (Cyan dilated edges)
+    curb_mask = (labels_val == 5)
+    if np.any(curb_mask):
+        for rx, ry in zip(px[curb_mask], py[curb_mask]):
+            cv2.circle(hud, (rx, ry), 2, COLOR_PALETTE[5], -1)
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+    # 3. Static Barriers & Walls (Orange)
+    obs_mask = (labels_val == 4)
+    if np.any(obs_mask):
+        for rx, ry in zip(px[obs_mask], py[obs_mask]):
+            cv2.circle(hud, (rx, ry), 2, COLOR_PALETTE[4], -1)
 
-        fps = 1.0 / max(time.perf_counter() - t0, 1e-5)
-        return grids, fps
+    # 4. Dynamic Objects: Vehicles (Blue) and Pedestrians (Red)
+    for cls_idx, rad in [(1, 3), (2, 3)]:
+        cls_mask = (labels_val == cls_idx)
+        if np.any(cls_mask):
+            c = COLOR_PALETTE[cls_idx]
+            for rx, ry in zip(px[cls_mask], py[cls_mask]):
+                cv2.circle(hud, (rx, ry), rad, c, -1)
 
+    # Ego vehicle footprint
+    cv2.rectangle(hud, (center - 6, center - 13), (center + 6, center + 13), (0, 255, 255), -1)
+    cv2.line(hud, (center, center), (center, center - 17), (0, 0, 255), 2)
+
+    # Legend Header
+    cv2.rectangle(hud, (10, canvas_size - 38), (canvas_size - 10, canvas_size - 10), (18, 18, 18), -1)
+    cv2.putText(hud, "BLUE: Car | CYAN: Divider/Curb | ORANGE: Barrier | GREEN: Road | RED: Ped",
+                (18, canvas_size - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.40, (230, 230, 230), 1)
+    return hud
 
 def main():
-    # 1. Connect to CARLA
-    client = carla.Client("localhost", 2000)
+    device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+    print(f"[+] Active Execution Device: {torch.cuda.get_device_name(0)}")
+
+    window_name = "Calibrated SpConv 2.5D Perception HUD"
+    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+
+    # Load Backbone
+    model = SpConvUNet(in_channels=1, num_classes=5).to(device)
+    if os.path.exists(CHECKPOINT_PATH):
+        model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
+        print("[+] SemanticKITTI checkpoint loaded successfully.")
+    else:
+        print(f"[!] Warning: Checkpoint not found at {CHECKPOINT_PATH}. Using geometric pipeline.")
+    model.eval()
+
+    # Simulator Connection
+    client = carla.Client("127.0.0.1", 2000)
     client.set_timeout(10.0)
     world = client.get_world()
+    spectator = world.get_spectator()
 
-    # 2. Synchronous Mode with 20 Hz Fixed Delta
-    original_settings = world.get_settings()
+    # Synchronous Execution Setup (20 Hz)
     settings = world.get_settings()
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = 0.05
@@ -105,112 +172,120 @@ def main():
 
     traffic_manager = client.get_trafficmanager(8000)
     traffic_manager.set_synchronous_mode(True)
+    traffic_manager.set_global_distance_to_leading_vehicle(2.5)
 
-    blueprint_lib = world.get_blueprint_library()
+    bp_lib = world.get_blueprint_library()
+    vehicle_bp = bp_lib.filter("vehicle.tesla.model3")[0]
+    sp = world.get_map().get_spawn_points()[0]
+    vehicle = world.try_spawn_actor(vehicle_bp, sp)
+    if vehicle is None:
+        actors = world.get_actors().filter("vehicle.*")
+        vehicle = actors[0] if len(actors) > 0 else None
 
-    # 3. Spawn Ego Vehicle
-    vehicle_bp = blueprint_lib.filter("vehicle.tesla.model3")[0]
-    spawn_points = world.get_map().get_spawn_points()
-    vehicle = world.spawn_actor(vehicle_bp, spawn_points[0])
+    if vehicle is None:
+        raise RuntimeError("Failed to obtain ego vehicle actor.")
+
     vehicle.set_autopilot(True, traffic_manager.get_port())
 
-    # 4. Spawn 120m Range 64-Channel LiDAR
-    lidar_bp = blueprint_lib.find("sensor.lidar.ray_cast")
+    # CALIBRATED SENSOR SPECIFICATION
+    lidar_bp = bp_lib.find("sensor.lidar.ray_cast")
     lidar_bp.set_attribute("channels", "64")
-    lidar_bp.set_attribute("points_per_second", "800000")
+    lidar_bp.set_attribute("points_per_second", "600000")
     lidar_bp.set_attribute("rotation_frequency", "20")
-    lidar_bp.set_attribute("range", "120")
-    lidar_bp.set_attribute("upper_fov", "15.0")
-    lidar_bp.set_attribute("lower_fov", "-35.0")
+    lidar_bp.set_attribute("range", "80")
+    lidar_bp.set_attribute("upper_fov", "3.0")     # Suppresses sky noise, concentrates on curbs/cars
+    lidar_bp.set_attribute("lower_fov", "-25.0")   # Eliminates bumper blind spot
 
-    lidar_transform = carla.Transform(carla.Location(x=0.8, y=0.0, z=2.2))
-    lidar_actor = world.spawn_actor(lidar_bp, lidar_transform, attach_to=vehicle)
+    # Positioned at roof-front (x=0.8m) at standard height (z=1.85m)
+    lidar_transform = carla.Transform(carla.Location(x=0.8, y=0.0, z=1.85))
+    lidar = world.spawn_actor(lidar_bp, lidar_transform, attach_to=vehicle)
+    lidar_queue = queue.Queue(maxsize=5)
+    lidar.listen(lambda data: lidar_callback(data, lidar_queue))
 
-    lidar_queue = queue.Queue()
-    lidar_actor.listen(lambda data: lidar_queue.put(data))
-
-    pipeline = UltraFastCarlaPerception()
-    spectator = world.get_spectator()
-
-    cv2.namedWindow("Foveated 2.5D Perception [Near 20m | Far 120m]", cv2.WINDOW_NORMAL)
-    cv2.resizeWindow("Foveated 2.5D Perception [Near 20m | Far 120m]", 1000, 500)
-
-    print("[+] System running locked at 20 Hz (delta=0.05s) with OpenCV renderer.")
+    print("[+] Bridge active. Visualizing curbs, medians, and obstacles...")
 
     try:
         while True:
-            # Advance simulation clock by 1 tick
             world.tick()
+            update_spectator_follow_cam(spectator, vehicle)
 
-            # Retrieve frame from LiDAR queue
-            try:
-                lidar_data = lidar_queue.get(timeout=2.0)
-            except queue.Empty:
+            # Flush queue to always evaluate the latest sweep
+            points = None
+            while not lidar_queue.empty():
+                points = lidar_queue.get_nowait()
+
+            if points is None:
+                try:
+                    points = lidar_queue.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+
+            xyz = points[:, :3].copy()
+            # Convert CARLA (UE4) to ISO 8855 right-handed frame (flip Y)
+            xyz[:, 1] = -xyz[:, 1]
+            intensity = np.clip(points[:, 3:4], 0.0, 1.0)
+
+            # Voxelize to 0.05m resolution
+            voxel_size = 0.05
+            coords = np.floor((xyz + [80.0, 80.0, 4.0]) / voxel_size).astype(np.int32)
+            valid_mask = (coords[:, 0] >= 0) & (coords[:, 0] < 3200) & \
+                         (coords[:, 1] >= 0) & (coords[:, 1] < 3200) & \
+                         (coords[:, 2] >= 0) & (coords[:, 2] < 160)
+
+            coords = coords[valid_mask]
+            intensity = intensity[valid_mask]
+            xyz_valid = xyz[valid_mask]
+
+            if len(coords) == 0:
                 continue
 
-            # Update spectator camera behind ego car
-            transform = vehicle.get_transform()
-            spectator.set_transform(carla.Transform(
-                transform.location + carla.Location(z=16) - transform.get_forward_vector() * 18,
-                carla.Rotation(pitch=-35, yaw=transform.rotation.yaw)
-            ))
+            # Deduplicate indices to prevent SpConv rulebook collisions
+            _, u_idx = np.unique(coords, axis=0, return_index=True)
+            coords = coords[u_idx]
+            intensity = intensity[u_idx]
+            xyz_valid = xyz_valid[u_idx]
 
-            # Process frame
-            grids, fps = pipeline.process_raw_bytes(lidar_data.raw_data)
-            if grids is None:
-                continue
+            b_indices = np.zeros((coords.shape[0], 1), dtype=np.int32)
+            coords_b = np.hstack([b_indices, coords])
 
-            # Extract Band 0 (Near: 20m @ 10cm)
-            near_z = grids[0][:, :, 1].cpu().numpy()
-            near_step = grids[0][:, :, 3].cpu().numpy()
+            t_coords = torch.from_numpy(coords_b).to(device=device, dtype=torch.int32).contiguous()
+            t_feats = torch.from_numpy(intensity).to(device=device, dtype=torch.float32).contiguous()
 
-            # Extract Band 2 (Far: 120m @ 60cm)
-            far_z = grids[2][:, :, 1].cpu().numpy()
+            x_sp = spconv.SparseConvTensor(
+                features=t_feats,
+                indices=t_coords,
+                spatial_shape=[3200, 3200, 160],
+                batch_size=1
+            )
 
-            # Fast OpenCV Colormap Conversion
-            near_norm = np.clip((near_z + 2.5) / 3.5 * 255.0, 0, 255).astype(np.uint8)
-            near_bgr = cv2.applyColorMap(near_norm, cv2.COLORMAP_VIRIDIS)
-            near_bgr[near_z == 0.0] = [20, 20, 20]
+            # Sparse Convolution Inference
+            with torch.inference_mode():
+                with torch.amp.autocast('cuda'):
+                    logits = model(x_sp)
+                    raw_preds = torch.argmax(logits, dim=-1).cpu().numpy()
 
-            # Highlight Curbs / Obstacles in Red
-            curb_mask = (near_step > 0.12) & (near_z != 0.0)
-            near_bgr[curb_mask] = [0, 0, 255]
+            # Elevation-Aware Geometric Refinement (Sensor mounted at z=1.85m -> road plane at -1.85m)
+            fused_labels = extract_curbs_and_obstacles(xyz_valid, raw_preds, z_ground_ref=-1.85)
 
-            # Far Field Colormap
-            far_norm = np.clip((far_z + 3.5) / 7.0 * 255.0, 0, 255).astype(np.uint8)
-            far_bgr = cv2.applyColorMap(far_norm, cv2.COLORMAP_INFERNO)
-            far_bgr[far_z == 0.0] = [20, 20, 20]
+            # Render BEV HUD
+            hud_image = render_bev_hud(xyz_valid, fused_labels, canvas_size=800, range_m=40.0)
+            cv2.imshow(window_name, hud_image)
 
-            # Vehicle markers
-            cv2.circle(near_bgr, (200, 200), 4, (255, 255, 0), -1)
-            cv2.circle(far_bgr, (200, 200), 3, (255, 255, 0), -1)
-
-            # Orient forward
-            near_bgr = cv2.flip(near_bgr, 0)
-            far_bgr = cv2.flip(far_bgr, 0)
-
-            # Combined canvas
-            combined = np.hstack([near_bgr, far_bgr])
-
-            # Text overlays
-            cv2.putText(combined, "Near Field: 0-20m @ 10cm", (15, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
-            cv2.putText(combined, f"Far Horizon: 0-120m @ 60cm | {fps:.1f} FPS", (425, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
-
-            cv2.imshow("Foveated 2.5D Perception [Near 20m | Far 120m]", combined)
             if cv2.waitKey(1) & 0xFF == ord('q'):
                 break
 
-    except KeyboardInterrupt:
-        print("\n[+] Exiting...")
     finally:
-        print("[+] Restoring simulator settings and destroying actors...")
-        world.apply_settings(original_settings)
-        lidar_actor.stop()
-        lidar_actor.destroy()
-        vehicle.destroy()
-        cv2.destroyAllWindows()
+        print("\n[+] Restoring simulator settings and cleaning actors...")
+        try:
+            traffic_manager.set_synchronous_mode(False)
+            settings.synchronous_mode = False
+            world.apply_settings(settings)
+            lidar.stop()
+            lidar.destroy()
+            vehicle.destroy()
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
 if __name__ == "__main__":
     main()
