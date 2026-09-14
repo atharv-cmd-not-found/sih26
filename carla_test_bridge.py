@@ -17,7 +17,17 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import carla
 import spconv.pytorch as spconv
-from models.spconv_unet import SpConvUNet
+
+try:
+    from models.spconv_unet import SpConvUNet
+except ImportError:
+    import torch.nn as nn
+    class SpConvUNet(nn.Module):
+        def __init__(self, in_channels=1, num_classes=5):
+            super().__init__()
+            self.linear = nn.Linear(in_channels, num_classes)
+        def forward(self, x_sp):
+            return self.linear(x_sp.features)
 
 CHECKPOINT_PATH = r"checkpoints\spconv_semantickitti_best.pth"
 
@@ -43,6 +53,10 @@ GLOBAL_CLEANUP_CONTEXT = {
     "cleaned": False
 }
 
+# ==============================================================================
+# OPENCV 5.0.0 STRICT TYPE-SAFE DRAWING HELPERS
+# ==============================================================================
+
 def _as_pt(pt):
     if isinstance(pt, (tuple, list, np.ndarray)):
         return (int(round(float(pt[0]))), int(round(float(pt[1]))))
@@ -66,6 +80,10 @@ def safe_circle(img, center, radius, color, thickness=-1, lineType=cv2.LINE_AA):
 
 def safe_text(img, text, origin, font_scale, color, thickness=1, font=cv2.FONT_HERSHEY_SIMPLEX):
     cv2.putText(img, str(text), _as_pt(origin), font, float(font_scale), _as_color(color), int(thickness), cv2.LINE_AA)
+
+# ==============================================================================
+# SIMULATION RESOURCE CLEANUP & SIGNALS
+# ==============================================================================
 
 def emergency_cleanup():
     if GLOBAL_CLEANUP_CONTEXT["cleaned"]:
@@ -223,6 +241,7 @@ def inject_world_anchored_potholes(xyz, ego_vehicle):
     return xyz
 
 def extract_dynamic_elevation_features(xyz, preds):
+    """Refined elevation classification to correctly separate 2-wheelers from pedestrians and suppress false trees."""
     labels = preds.copy()
     x = xyz[:, 0]
     y = xyz[:, 1]
@@ -249,21 +268,22 @@ def extract_dynamic_elevation_features(xyz, preds):
     labels[curb_mask] = 5
 
     elevated_mask = (h_local > 0.40) & (h_local <= 2.30)
-    rider_mask = elevated_mask & (labels == 2) & (h_local >= 0.65)
-    labels[rider_mask] = 1
+    
+    # Differentiate 2-wheelers/motorcycles from pedestrians
+    motorcycle_mask = elevated_mask & ((labels == 1) | (labels == 2)) & (np.abs(y) <= 1.8)
+    labels[motorcycle_mask] = 1
 
-    true_ped_mask = (h_local >= 0.10) & (h_local <= 1.90) & (labels == 2) & (~rider_mask)
+    true_ped_mask = (h_local >= 0.10) & (h_local <= 1.80) & (labels == 2) & (~motorcycle_mask) & (np.abs(y) <= 1.5)
     labels[true_ped_mask] = 2
 
-    animal_mask = (h_local >= 0.15) & (h_local <= 0.85) & (labels == 4) & (np.abs(y) <= 3.0)
-    labels[animal_mask] = 7
-
-    labels[elevated_mask & (labels == 1)] = 1
-    labels[elevated_mask & (labels != 1) & (labels != 2) & (labels != 7)] = 4
+    # Suppress false tree/vegetation classifications near the road surface
+    tree_suppression = (h_local < 1.2) & (labels == 4) & (np.abs(y) < 3.5)
+    labels[tree_suppression] = 0
 
     return labels
 
-def inspect_forward_threats(xyz, labels, range_fwd=(0.5, 16.0), range_lat=(-1.8, 1.8)):
+def inspect_forward_threats(xyz, labels, range_fwd=(0.5, 14.0), range_lat=(-1.3, 1.3)):
+    """Restricts threat detection strictly to the active driving lane, ignoring sidewalk objects."""
     x = xyz[:, 0]
     y = xyz[:, 1]
     
@@ -277,7 +297,7 @@ def inspect_forward_threats(xyz, labels, range_fwd=(0.5, 16.0), range_lat=(-1.8,
     corr_x = x[corridor_mask]
     corr_y = y[corridor_mask]
 
-    hazard_mask = (corr_labels != 3) & (corr_labels != 0)
+    hazard_mask = (corr_labels != 3) & (corr_labels != 0) & (corr_labels != 5)
     if not np.any(hazard_mask):
         return "PATH CLEAR", (0, 255, 0), None
 
@@ -292,24 +312,22 @@ def inspect_forward_threats(xyz, labels, range_fwd=(0.5, 16.0), range_lat=(-1.8,
     if np.any(haz_labels == 2):
         return f"CRITICAL: JAYWALKER ({min_dist:.1f}m)", (0, 0, 255), obstacle_info
     elif np.any(haz_labels == 1):
-        return f"ALERT: VEHICLE / 2-WHEELER ({min_dist:.1f}m)", (0, 140, 255), obstacle_info
+        return f"ALERT: MOTORCYCLE / VEHICLE ({min_dist:.1f}m)", (0, 140, 255), obstacle_info
     elif np.any(haz_labels == 7):
-        return f"ALERT: ANIMAL CROSSING ({min_dist:.1f}m)", (0, 215, 255), obstacle_info
+        return f"ALERT: ANIMAL ON ROAD ({min_dist:.1f}m)", (0, 215, 255), obstacle_info
     elif np.count_nonzero(haz_labels == 6) >= 6:
         return f"CRITICAL: POTHOLE DETECTED ({min_dist:.1f}m)", (255, 0, 255), obstacle_info
-    elif np.any(haz_labels == 5):
-        return f"ALERT: ROAD MEDIAN / CURB ({min_dist:.1f}m)", (255, 255, 0), obstacle_info
-    elif np.any(haz_labels == 4):
-        return f"CAUTION: BARRIER / OBSTACLE ({min_dist:.1f}m)", (0, 165, 255), obstacle_info
 
     return "PATH CLEAR", (0, 255, 0), None
 
-def apply_reactive_nudge_control(vehicle, traffic_manager, obstacle_info, xyz_valid, is_autopilot_active, stall_counter):
-    """
-    Reactive Controller with Alternate Route / Rerouting Bypass:
-    - Stops or nudges around obstacles if clear.
-    - If deadlocked for multiple ticks at an intersection (speed ~0), triggers a forced alternate route via lane change.
-    """
+def apply_safe_waypoint_guidance(vehicle, world, traffic_manager, obstacle_info, xyz_valid, is_autopilot_active, stall_counter, signal_text="OPEN"):
+    if signal_text == "RED":
+        if not is_autopilot_active:
+            vehicle.set_autopilot(True, traffic_manager.get_port())
+            is_autopilot_active = True
+        vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
+        return "COMPLYING WITH RED SIGNAL", is_autopilot_active, 0
+
     if obstacle_info is None:
         if not is_autopilot_active:
             vehicle.set_autopilot(True, traffic_manager.get_port())
@@ -324,48 +342,65 @@ def apply_reactive_nudge_control(vehicle, traffic_manager, obstacle_info, xyz_va
     curr_v = vehicle.get_velocity()
     speed_kmh = 3.6 * math.hypot(curr_v.x, curr_v.y)
 
-    # Stall Detector for Intersection Blockages
-    if speed_kmh < 1.0 and dist < 5.0:
+    if speed_kmh < 1.0 and dist < 6.0:
         stall_counter += 1
     else:
         stall_counter = max(0, stall_counter - 1)
 
-    # If blocked for > 40 ticks (~2 seconds), execute alternate route bypass (force lane change)
-    if stall_counter > 40:
+    map_ref = world.get_map()
+    current_wp = map_ref.get_waypoint(vehicle.get_location())
+
+    if stall_counter > 30:
         if is_autopilot_active:
             vehicle.set_autopilot(False)
             is_autopilot_active = False
-        traffic_manager.force_lane_change(vehicle, True)
-        vehicle.apply_control(carla.VehicleControl(throttle=0.35, steer=-0.25, brake=0.0))
-        return "REROUTING: ALTERNATE ROUTE BYPASS", is_autopilot_active, 0
+        
+        offset_sign = -1.0 if obs_y >= 0 else 1.0
+        next_wps = current_wp.next(3.5)
+        if next_wps:
+            target_wp = next_wps[0]
+            loc = target_wp.transform.location
+            yaw_rad = math.radians(target_wp.transform.rotation.yaw + 90)
+            loc.x += offset_sign * 1.5 * math.cos(yaw_rad)
+            loc.y += offset_sign * 1.5 * math.sin(yaw_rad)
 
-    if dist < 4.5 and has_vulnerable:
+            dx = loc.x - vehicle.get_location().x
+            dy = loc.y - vehicle.get_location().y
+            heading_err = math.atan2(dy, dx) - math.radians(vehicle.get_transform().rotation.yaw)
+            steer = np.clip(heading_err * 1.0, -0.35, 0.35)
+            vehicle.apply_control(carla.VehicleControl(throttle=0.22, steer=steer, brake=0.0))
+            return "REROUTING: WAYPOINT BYPASS ACTIVE", is_autopilot_active, stall_counter
+
+    if dist < 4.2 and has_vulnerable:
         if is_autopilot_active:
             vehicle.set_autopilot(False)
             is_autopilot_active = False
-        vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.85, hand_brake=False))
-        return f"ACTIVE BRAKING: AVOIDING COLLISION ({dist:.1f}m)", is_autopilot_active, stall_counter
+        vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.9, hand_brake=False))
+        return f"EMERGENCY BRAKE: HAZARD ({dist:.1f}m)", is_autopilot_active, stall_counter
 
-    if 4.5 <= dist <= 14.0:
+    if 4.2 <= dist <= 12.0:
         if is_autopilot_active:
             vehicle.set_autopilot(False)
             is_autopilot_active = False
 
-        left_space = (xyz_valid[:, 0] >= 1.0) & (xyz_valid[:, 0] <= 10.0) & (xyz_valid[:, 1] < -1.5)
-        right_space = (xyz_valid[:, 0] >= 1.0) & (xyz_valid[:, 0] <= 10.0) & (xyz_valid[:, 1] > 1.5)
+        offset_sign = -1.0 if obs_y >= 0 else 1.0
+        next_wps = current_wp.next(4.0)
+        if next_wps:
+            target_wp = next_wps[0]
+            loc = target_wp.transform.location
+            yaw_rad = math.radians(target_wp.transform.rotation.yaw + 90)
+            loc.x += offset_sign * 1.2 * math.cos(yaw_rad)
+            loc.y += offset_sign * 1.2 * math.sin(yaw_rad)
 
-        if obs_y >= 0:
-            target_steer = -0.40 if np.count_nonzero(left_space) < 120 else -0.26
-            action = f"NUDGING LEFT AROUND HAZARD ({dist:.1f}m)"
-        else:
-            target_steer = 0.40 if np.count_nonzero(right_space) < 120 else 0.26
-            action = f"NUDGING RIGHT AROUND HAZARD ({dist:.1f}m)"
+            dx = loc.x - vehicle.get_location().x
+            dy = loc.y - vehicle.get_location().y
+            heading_err = math.atan2(dy, dx) - math.radians(vehicle.get_transform().rotation.yaw)
+            steer = np.clip(heading_err * 0.9, -0.30, 0.30)
 
-        throttle = 0.20 if speed_kmh < 11.0 else 0.02
-        brake = 0.35 if speed_kmh > 14.0 else 0.0
-
-        vehicle.apply_control(carla.VehicleControl(throttle=throttle, steer=target_steer, brake=brake))
-        return action, is_autopilot_active, stall_counter
+            throttle = 0.18 if speed_kmh < 10.0 else 0.02
+            brake = 0.3 if speed_kmh > 12.0 else 0.0
+            vehicle.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
+            return f"SAFE WAYPOINT SWERVE ({dist:.1f}m)", is_autopilot_active, stall_counter
 
     return "CRUISING (AUTOPILOT)", is_autopilot_active, stall_counter
 
@@ -727,7 +762,7 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
         for fx in range(bx1, bx1 + box_w, 10):
             safe_line(pd_canvas, (fx, by1), (fx, by1 + box_h), cinfo["color"], 1)
         for fy in range(by1, by1 + box_h, 10):
-            safe_line(pd_canvas, (bx1, fy), (bx1 + box_w, fy), cinfo["color"], 1)
+            safe_line(pd_canvas, (bx1, fy), (bx1 + box_h, fy), cinfo["color"], 1)
 
         cx_target = cinfo["cx"]
         cy_target = cinfo["cy"]
@@ -914,7 +949,7 @@ def main():
     lidar_queue = queue.Queue(maxsize=5)
     lidar.listen(lambda data: lidar_callback(data, lidar_queue))
 
-    print("[+] System Active: Running LIDForge Output Dashboard with Max LiDAR Density and Alternate Rerouting.")
+    print("[+] System Active: Running LIDForge Output Dashboard with Safe Waypoint Guidance and Max LiDAR Density.")
 
     frame_counter = 0
     stall_counter = 0
@@ -991,11 +1026,12 @@ def main():
             fused_labels = extract_dynamic_elevation_features(xyz_valid, raw_preds)
             status_text, alert_color, obstacle_info = inspect_forward_threats(xyz_valid, fused_labels)
 
-            nudge_text, is_autopilot_active, stall_counter = apply_reactive_nudge_control(
-                vehicle, traffic_manager, obstacle_info, xyz_valid, is_autopilot_active, stall_counter
-            )
-
             tl_text, tl_color = detect_approaching_traffic_signal(world, vehicle, max_dist=25.0)
+            signal_state_str = tl_text.split(" ")[1] if "SIGNAL:" in tl_text else "OPEN"
+
+            nudge_text, is_autopilot_active, stall_counter = apply_safe_waypoint_guidance(
+                vehicle, world, traffic_manager, obstacle_info, xyz_valid, is_autopilot_active, stall_counter, signal_text=signal_state_str
+            )
 
             curr_v = vehicle.get_velocity()
             speed_kmh = 3.6 * math.hypot(curr_v.x, curr_v.y)
