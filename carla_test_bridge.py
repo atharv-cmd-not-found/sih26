@@ -17,21 +17,10 @@ os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
 import carla
 import spconv.pytorch as spconv
-
-try:
-    from models.spconv_unet import SpConvUNet
-except ImportError:
-    import torch.nn as nn
-    class SpConvUNet(nn.Module):
-        def __init__(self, in_channels=1, num_classes=5):
-            super().__init__()
-            self.linear = nn.Linear(in_channels, num_classes)
-        def forward(self, x_sp):
-            return self.linear(x_sp.features)
+from models.spconv_unet import SpConvUNet
 
 CHECKPOINT_PATH = r"checkpoints\spconv_semantickitti_best.pth"
 
-# Semantic Color Palette (BGR)
 COLOR_PALETTE = {
     0: (35, 35, 35),       # Background / Unlabeled
     1: (255, 140, 0),      # Dynamic Vehicles / 2-Wheelers (Dodger Blue)
@@ -53,10 +42,6 @@ GLOBAL_CLEANUP_CONTEXT = {
     "actors": [],
     "cleaned": False
 }
-
-# ==============================================================================
-# OPENCV 5.0.0 STRICT TYPE-SAFE DRAWING HELPERS
-# ==============================================================================
 
 def _as_pt(pt):
     if isinstance(pt, (tuple, list, np.ndarray)):
@@ -81,10 +66,6 @@ def safe_circle(img, center, radius, color, thickness=-1, lineType=cv2.LINE_AA):
 
 def safe_text(img, text, origin, font_scale, color, thickness=1, font=cv2.FONT_HERSHEY_SIMPLEX):
     cv2.putText(img, str(text), _as_pt(origin), font, float(font_scale), _as_color(color), int(thickness), cv2.LINE_AA)
-
-# ==============================================================================
-# SIMULATION RESOURCE CLEANUP & SIGNALS
-# ==============================================================================
 
 def emergency_cleanup():
     if GLOBAL_CLEANUP_CONTEXT["cleaned"]:
@@ -153,9 +134,7 @@ def update_spectator_follow_cam(spectator, vehicle):
     )
 
 def configure_traffic_manager_safety(traffic_manager, ego_vehicle):
-    """Configures collision-free parameters to avoid hitting pedestrians and motorcyclists."""
     traffic_manager.set_synchronous_mode(True)
-    # Zero tolerance for ignoring collisions
     traffic_manager.ignore_vehicles_percentage(ego_vehicle, 0.0)
     traffic_manager.ignore_walkers_percentage(ego_vehicle, 0.0)
     traffic_manager.ignore_lights_percentage(ego_vehicle, 0.0)
@@ -193,7 +172,7 @@ def spawn_indian_traffic_profile(world, traffic_manager, num_vehicles=28):
             traffic_manager.vehicle_percentage_speed_difference(npc, random.uniform(-10.0, 20.0))
             actors.append(npc)
 
-    print(f"[+] Ambient Traffic Spawned: {len(actors)} vehicles (High 2-Wheeler Density).")
+    print(f"[+] Ambient Traffic Spawned: {len(actors)} vehicles.")
     return actors
 
 def spawn_active_forward_crossers(world, ego_vehicle):
@@ -205,10 +184,9 @@ def spawn_active_forward_crossers(world, ego_vehicle):
     fwd_vec = carla.Vector3D(math.cos(yaw_rad), math.sin(yaw_rad), 0.0)
     right_vec = carla.Vector3D(-math.sin(yaw_rad), math.cos(yaw_rad), 0.0)
 
-    # 1. Jaywalker crossing roadway
     crosser_bp = random.choice(list(bp_lib.filter("walker.pedestrian.*")))
-    loc_start = ego_tf.location + (fwd_vec * 22.0) + (right_vec * 5.0)
-    loc_end = ego_tf.location + (fwd_vec * 22.0) - (right_vec * 6.5)
+    loc_start = ego_tf.location + (fwd_vec * 18.0) + (right_vec * 3.5)
+    loc_end = ego_tf.location + (fwd_vec * 18.0) - (right_vec * 5.0)
 
     walker = world.try_spawn_actor(crosser_bp, carla.Transform(loc_start))
     if walker is not None:
@@ -216,21 +194,8 @@ def spawn_active_forward_crossers(world, ego_vehicle):
         ctrl = world.spawn_actor(c_bp, carla.Transform(), attach_to=walker)
         ctrl.start()
         ctrl.go_to_location(loc_end)
-        ctrl.set_max_speed(1.3)
+        ctrl.set_max_speed(1.4)
         actors.extend([ctrl, walker])
-
-    # 2. Stray quadruped profile crossing further ahead
-    stray_bps = list(bp_lib.filter("walker.pedestrian.0010")) or list(bp_lib.filter("walker.pedestrian.*"))
-    stray_start = ego_tf.location + (fwd_vec * 36.0) - (right_vec * 4.5)
-    stray_end = ego_tf.location + (fwd_vec * 36.0) + (right_vec * 5.5)
-    stray = world.try_spawn_actor(random.choice(stray_bps), carla.Transform(stray_start))
-    if stray is not None:
-        c_bp = bp_lib.find('controller.ai.walker')
-        ctrl = world.spawn_actor(c_bp, carla.Transform(), attach_to=stray)
-        ctrl.start()
-        ctrl.go_to_location(stray_end)
-        ctrl.set_max_speed(1.1)
-        actors.extend([ctrl, stray])
 
     return actors
 
@@ -299,7 +264,6 @@ def extract_dynamic_elevation_features(xyz, preds):
     return labels
 
 def inspect_forward_threats(xyz, labels, range_fwd=(0.5, 16.0), range_lat=(-1.8, 1.8)):
-    """Comprehensive safety corridor inspection to detect dynamic obstacles early."""
     x = xyz[:, 0]
     y = xyz[:, 1]
     
@@ -340,32 +304,48 @@ def inspect_forward_threats(xyz, labels, range_fwd=(0.5, 16.0), range_lat=(-1.8,
 
     return "PATH CLEAR", (0, 255, 0), None
 
-def apply_reactive_nudge_control(vehicle, traffic_manager, obstacle_info, xyz_valid, is_autopilot_active):
+def apply_reactive_nudge_control(vehicle, traffic_manager, obstacle_info, xyz_valid, is_autopilot_active, stall_counter):
     """
-    Collision-free active reactive controller:
-    - Stops immediately if a pedestrian or motorcyclist is within critical distance (< 4.5m)
-    - Slows and steers safely around obstacles detected further ahead (4.5m to 14m)
+    Reactive Controller with Alternate Route / Rerouting Bypass:
+    - Stops or nudges around obstacles if clear.
+    - If deadlocked for multiple ticks at an intersection (speed ~0), triggers a forced alternate route via lane change.
     """
     if obstacle_info is None:
         if not is_autopilot_active:
             vehicle.set_autopilot(True, traffic_manager.get_port())
             is_autopilot_active = True
-        return "CRUISING (AUTOPILOT)", is_autopilot_active
+        return "CRUISING (AUTOPILOT)", is_autopilot_active, 0
 
     dist = obstacle_info["dist"]
     obs_y = obstacle_info["y"]
     labels = obstacle_info["labels"]
     has_vulnerable = np.any((labels == 2) | (labels == 1) | (labels == 7))
 
-    # Critical Stopping Zone (< 4.5m): Apply decisive brake to prevent impact
+    curr_v = vehicle.get_velocity()
+    speed_kmh = 3.6 * math.hypot(curr_v.x, curr_v.y)
+
+    # Stall Detector for Intersection Blockages
+    if speed_kmh < 1.0 and dist < 5.0:
+        stall_counter += 1
+    else:
+        stall_counter = max(0, stall_counter - 1)
+
+    # If blocked for > 40 ticks (~2 seconds), execute alternate route bypass (force lane change)
+    if stall_counter > 40:
+        if is_autopilot_active:
+            vehicle.set_autopilot(False)
+            is_autopilot_active = False
+        traffic_manager.force_lane_change(vehicle, True)
+        vehicle.apply_control(carla.VehicleControl(throttle=0.35, steer=-0.25, brake=0.0))
+        return "REROUTING: ALTERNATE ROUTE BYPASS", is_autopilot_active, 0
+
     if dist < 4.5 and has_vulnerable:
         if is_autopilot_active:
             vehicle.set_autopilot(False)
             is_autopilot_active = False
         vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=0.85, hand_brake=False))
-        return f"ACTIVE BRAKING: AVOIDING COLLISION ({dist:.1f}m)", is_autopilot_active
+        return f"ACTIVE BRAKING: AVOIDING COLLISION ({dist:.1f}m)", is_autopilot_active, stall_counter
 
-    # Proactive Swerve / Nudge Zone (4.5m to 14.0m)
     if 4.5 <= dist <= 14.0:
         if is_autopilot_active:
             vehicle.set_autopilot(False)
@@ -374,23 +354,20 @@ def apply_reactive_nudge_control(vehicle, traffic_manager, obstacle_info, xyz_va
         left_space = (xyz_valid[:, 0] >= 1.0) & (xyz_valid[:, 0] <= 10.0) & (xyz_valid[:, 1] < -1.5)
         right_space = (xyz_valid[:, 0] >= 1.0) & (xyz_valid[:, 0] <= 10.0) & (xyz_valid[:, 1] > 1.5)
 
-        if obs_y >= 0:  # Obstacle is on right side -> steer left
+        if obs_y >= 0:
             target_steer = -0.40 if np.count_nonzero(left_space) < 120 else -0.26
             action = f"NUDGING LEFT AROUND HAZARD ({dist:.1f}m)"
-        else:           # Obstacle is on left side -> steer right
+        else:
             target_steer = 0.40 if np.count_nonzero(right_space) < 120 else 0.26
             action = f"NUDGING RIGHT AROUND HAZARD ({dist:.1f}m)"
 
-        curr_v = vehicle.get_velocity()
-        speed_kmh = 3.6 * math.hypot(curr_v.x, curr_v.y)
-        # Regulate controlled slow speed during swerve (10-14 km/h)
         throttle = 0.20 if speed_kmh < 11.0 else 0.02
         brake = 0.35 if speed_kmh > 14.0 else 0.0
 
         vehicle.apply_control(carla.VehicleControl(throttle=throttle, steer=target_steer, brake=brake))
-        return action, is_autopilot_active
+        return action, is_autopilot_active, stall_counter
 
-    return "CRUISING (AUTOPILOT)", is_autopilot_active
+    return "CRUISING (AUTOPILOT)", is_autopilot_active, stall_counter
 
 def detect_approaching_traffic_signal(world, vehicle, max_dist=25.0):
     if vehicle.is_at_traffic_light():
@@ -453,7 +430,6 @@ def project_array(x_arr, y_arr, origin_x, origin_y, w, h, max_fwd=75.0, lat_span
     return sx, sy
 
 def draw_prominent_ego_vehicle(canvas, cx, cy, fwd_len_px=45):
-    """Renders high-visibility Tesla Model 3 ego silhouette with projection corridor."""
     corridor_half_w = 12
     for step in range(0, fwd_len_px, 8):
         safe_line(canvas, (cx - corridor_half_w, cy - 20 - step),
@@ -470,47 +446,36 @@ def draw_prominent_ego_vehicle(canvas, cx, cy, fwd_len_px=45):
     safe_rect(canvas, (cx - w_half, cy - l_front),
                       (cx + w_half, cy + l_rear), (40, 45, 50), -1)
 
-    # Windshield and cabin glass
     safe_rect(canvas, (cx - w_half + 2, cy - 7),
                       (cx + w_half - 2, cy + 4), (180, 200, 220), -1)
 
-    # Dual forward headlights
     safe_rect(canvas, (cx - w_half + 1, cy - l_front),
                       (cx - w_half + 4, cy - l_front + 3), (0, 255, 255), -1)
     safe_rect(canvas, (cx + w_half - 4, cy - l_front),
                       (cx + w_half - 1, cy - l_front + 3), (0, 255, 255), -1)
 
-    # Taillights
     safe_rect(canvas, (cx - w_half + 1, cy + l_rear - 2),
                       (cx - w_half + 4, cy + l_rear), (0, 0, 255), -1)
     safe_rect(canvas, (cx + w_half - 4, cy + l_rear - 2),
                       (cx + w_half - 1, cy + l_rear), (0, 0, 255), -1)
 
-    # Heading indicator
     safe_line(canvas, (cx, cy - 7), (cx, cy - l_front - 8), (0, 255, 255), 2)
     safe_line(canvas, (cx, cy - l_front - 8), (cx - 4, cy - l_front - 3), (0, 255, 255), 2)
     safe_line(canvas, (cx, cy - l_front - 8), (cx + 4, cy - l_front - 3), (0, 255, 255), 2)
 
-    # Chassis badge
     safe_rect(canvas, (cx - 32, cy + l_rear + 4), (cx + 32, cy + l_rear + 18), (20, 20, 20), -1)
     safe_rect(canvas, (cx - 32, cy + l_rear + 4), (cx + 32, cy + l_rear + 18), (0, 220, 255), 1)
     safe_text(canvas, "EGO VEHICLE", (cx - 28, cy + l_rear + 14), 0.30, (0, 255, 255), 1)
-
-# ==============================================================================
-# UPGRADED HIGH-DENSITY LIDFORGE DASHBOARD
-# ==============================================================================
 
 def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl_color, nudge_text, fps, speed_kmh):
     canvas_w = 1600
     canvas_h = 950
     canvas = np.full((canvas_h, canvas_w, 3), 16, dtype=np.uint8)
 
-    # 1. Header Section
     safe_text(canvas, "LIDForge", (30, 48), 1.25, (255, 180, 50), 2, cv2.FONT_HERSHEY_DUPLEX)
     safe_text(canvas, " - Output Visualization", (205, 48), 1.05, (235, 235, 235), 2, cv2.FONT_HERSHEY_DUPLEX)
     safe_text(canvas, "Range-aware base grid + scene-adaptive refinement", (32, 78), 0.56, (175, 175, 175), 1)
 
-    # Header Card 1: Base Resolution
     c1_x1, c1_y1, c1_x2, c1_y2 = 820, 16, 1180, 88
     safe_rect(canvas, (c1_x1, c1_y1), (c1_x2, c1_y2), (24, 24, 24), -1)
     safe_rect(canvas, (c1_x1, c1_y1), (c1_x2, c1_y2), (55, 55, 55), 1)
@@ -518,7 +483,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     safe_text(canvas, "0 - 20 m -> 5 cm cells (fine)", (c1_x1 + 14, c1_y1 + 44), 0.40, (200, 200, 200), 1)
     safe_text(canvas, "20 - 120 m -> 60 cm cells (coarse)", (c1_x1 + 14, c1_y1 + 64), 0.40, (200, 200, 200), 1)
 
-    # Header Card 2: Adaptive Refinement
     c2_x1, c2_y1, c2_x2, c2_y2 = 1200, 16, 1570, 88
     safe_rect(canvas, (c2_x1, c2_y1), (c2_x2, c2_y2), (24, 24, 24), -1)
     safe_rect(canvas, (c2_x1, c2_y1), (c2_x2, c2_y2), (55, 55, 55), 1)
@@ -526,7 +490,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     safe_text(canvas, "Locally increases resolution in", (c2_x1 + 14, c2_y1 + 44), 0.40, (200, 200, 200), 1)
     safe_text(canvas, "high-density, dynamic, or complex regions.", (c2_x1 + 14, c2_y1 + 64), 0.40, (200, 200, 200), 1)
 
-    # 2. Middle Row: Panels (a), (b), (c)
     top_y = 105
     panel_h = 425
     panel_w = 490
@@ -544,9 +507,7 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     z_sub = xyz[valid_mask, 2]
     l_sub = labels[valid_mask]
 
-    # ==========================================================================
-    # PANEL (a): (a) LiDAR Point Cloud (Top View) -> DENSE POINT RETURNS
-    # ==========================================================================
+    # Panel (a)
     safe_rect(canvas, (pa_x, top_y), (pa_x + panel_w, top_y + panel_h), (18, 18, 18), -1)
     safe_rect(canvas, (pa_x, top_y), (pa_x + panel_w, top_y + panel_h), (50, 50, 50), 1)
     safe_text(canvas, "(a) LiDAR Point Cloud (Top View)", (pa_x + 15, top_y + 24), 0.50, (230, 230, 230), 1)
@@ -571,7 +532,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
             canvas[np.clip(sy_a[m] + 1, 0, canvas_h - 1), sx_a[m]] = c
             canvas[sy_a[m], np.clip(sx_a[m] + 1, 0, canvas_w - 1)] = c
 
-    # Dynamic Object Bounding Callouts
     veh_mask = (l_sub == 1) & (x_sub > 8.0)
     v_px, v_py, vx_m, vy_m = None, None, 30.0, 0.0
     if np.any(veh_mask):
@@ -599,24 +559,19 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
         safe_rect(canvas, (t_px - 18, t_py - 18), (t_px + 18, t_py + 18), (0, 215, 255), 2)
         safe_text(canvas, f"Tree ({int(tx_m)} m)", (t_px - 30, t_py - 22), 0.40, (0, 215, 255), 1)
 
-    # Prominent Ego Vehicle footprint (No bottom banner overlaying it)
     draw_prominent_ego_vehicle(canvas, cx_pa, bot_pa, fwd_len_px=45)
 
-    # ==========================================================================
-    # PANEL (b): (b) Multi-Resolution 2.5D Grid (Top View) -> STRUCTURED GRID
-    # ==========================================================================
+    # Panel (b)
     safe_rect(canvas, (pb_x, top_y), (pb_x + panel_w, top_y + panel_h), (18, 18, 18), -1)
     safe_rect(canvas, (pb_x, top_y), (pb_x + panel_w, top_y + panel_h), (50, 50, 50), 1)
     safe_text(canvas, "(b) Multi-Resolution 2.5D Grid (Top View)", (pb_x + 15, top_y + 24), 0.50, (230, 230, 230), 1)
 
-    # 1. Base Far Grid (60cm coarse blue wireframe)
     coarse_sz = 22
     for gx in range(pb_x + 10, pb_x + panel_w - 10, coarse_sz):
         safe_line(canvas, (gx, top_y + 35), (gx, top_y + panel_h - 35), (65, 50, 30), 1)
     for gy in range(top_y + 35, top_y + panel_h - 35, coarse_sz):
         safe_line(canvas, (pb_x + 10, gy), (pb_x + panel_w - 10, gy), (65, 50, 30), 1)
 
-    # 2. Point Cloud Semantics Inside Grid
     sx_b, sy_b = project_array(x_sub, y_sub, pb_x, top_y, panel_w, panel_h, max_fwd, lat_span)
     for cls_id in [3, 5, 1, 2, 6, 7]:
         m = (l_sub == cls_id)
@@ -625,7 +580,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
             if cls_id in [1, 2, 5, 6]:
                 canvas[np.clip(sy_b[m] + 1, 0, canvas_h - 1), sx_b[m]] = COLOR_PALETTE[cls_id]
 
-    # 3. Base Near Grid (5cm fine gold mesh in the 0-20m region)
     cx_pb = pb_x + panel_w // 2
     bot_pb = top_y + panel_h - 35
     near_h = int((20.0 / max_fwd) * (panel_h - 75))
@@ -636,7 +590,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     for fy in range(near_top, bot_pb, fine_sz):
         safe_line(canvas, (cx_pb - 95, fy), (cx_pb + 95, fy), (0, 165, 255), 1)
 
-    # 4. Adaptive Refinement Sub-Grids on distant targets
     if p_px is not None:
         c_x = p_px + (pb_x - pa_x)
         c_y = p_py
@@ -664,10 +617,8 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
         for sl in range(c_y - 26, c_y + 26, 6):
             safe_line(canvas, (c_x - 26, sl), (c_x + 26, sl), (0, 160, 200), 1)
 
-    # Prominent Ego Vehicle on Panel (b)
     draw_prominent_ego_vehicle(canvas, cx_pb, bot_pb, fwd_len_px=45)
 
-    # Legend for Panel (b)
     leg_x = pb_x + panel_w - 170
     safe_rect(canvas, (leg_x, top_y + 12), (leg_x + 12, top_y + 24), (0, 165, 255), 2)
     safe_text(canvas, "Base (near, 5 cm)", (leg_x + 18, top_y + 22), 0.35, (210, 210, 210), 1)
@@ -678,14 +629,11 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     safe_rect(canvas, (leg_x, top_y + 48), (leg_x + 12, top_y + 60), (0, 0, 255), 2)
     safe_text(canvas, "Adaptive refinement", (leg_x + 18, top_y + 58), 0.35, (210, 210, 210), 1)
 
-    # ==========================================================================
-    # PANEL (c): (c) Bird's-Eye Height Map -> SHARP 2.5D ELEVATION RASTER
-    # ==========================================================================
+    # Panel (c)
     safe_rect(canvas, (pc_x, top_y), (pc_x + panel_w, top_y + panel_h), (20, 20, 20), -1)
     safe_rect(canvas, (pc_x, top_y), (pc_x + panel_w, top_y + panel_h), (50, 50, 50), 1)
     safe_text(canvas, "(c) Bird's-Eye Height Map (2.5D Output)", (pc_x + 15, top_y + 24), 0.50, (230, 230, 230), 1)
 
-    # High-definition raster grid matched directly to display size
     grid_h = panel_h - 60
     grid_w = panel_w - 60
     h_grid = np.zeros((grid_h, grid_w), dtype=np.float32)
@@ -695,7 +643,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
         gy = np.clip(((y_sub + lat_span) / (2.0 * lat_span) * (grid_w - 1)).astype(np.int32), 0, grid_w - 1)
         h_vals = np.clip(z_sub + 1.85, 0.0, 10.0)
 
-        # Baseline asphalt road elevation (~0.65m)
         road_mask_sub = (l_sub == 3)
         if np.any(road_mask_sub):
             h_grid[gx[road_mask_sub], gy[road_mask_sub]] = 0.65
@@ -704,19 +651,16 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
             if h_vals[i] > h_grid[gx[i], gy[i]]:
                 h_grid[gx[i], gy[i]] = h_vals[i]
 
-    # Minimal 3x3 morphological closing to fill scan-line gaps without blurring sharp edges
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     h_closed = cv2.morphologyEx(h_grid, cv2.MORPH_CLOSE, kernel)
     h_norm = np.clip((h_closed / 10.0) * 255.0, 0, 255).astype(np.uint8)
     h_color = cv2.applyColorMap(h_norm, cv2.COLORMAP_TURBO)
     
-    # Mask background void cleanly
     valid_road_space = (h_closed > 0.0).astype(np.uint8)
     h_color[valid_road_space == 0] = [20, 20, 20]
 
     canvas[top_y + 35: top_y + 35 + grid_h, pc_x + 15: pc_x + 15 + grid_w] = h_color
 
-    # Vertical Height Colorbar
     cb_x = pc_x + panel_w - 38
     cb_y1 = top_y + 45
     cb_h = panel_h - 90
@@ -730,15 +674,11 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     safe_text(canvas, "5", (cb_x + 18, cb_y1 + cb_h // 2), 0.35, (220, 220, 220), 1)
     safe_text(canvas, "0", (cb_x + 18, cb_y1 + cb_h), 0.35, (220, 220, 220), 1)
 
-    # --------------------------------------------------------------------------
-    # 3. BOTTOM ROW: PANELS (d) & (e)
-    # --------------------------------------------------------------------------
+    # Bottom Row: Panels (d) & (e)
     bot_y = 545
     bot_h = 315
 
-    # ==========================================================================
-    # PANEL (d): ZOOMED IN REGIONS (RENDERED ON ISOLATED SUB-CANVAS)
-    # ==========================================================================
+    # Panel (d) on isolated sub-canvas
     pd_w = 1080
     pd_canvas = np.full((bot_h, pd_w, 3), 20, dtype=np.uint8)
     safe_rect(pd_canvas, (0, 0), (pd_w - 1, bot_h - 1), (50, 50, 50), 1)
@@ -822,12 +762,9 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
         safe_text(pd_canvas, cinfo["base_text"], (sc_x, gv_y + gv_h + 18), 0.36, (200, 200, 200), 1)
         safe_text(pd_canvas, cinfo["reason"], (sc_x, gv_y + gv_h + 36), 0.36, (150, 150, 150), 1)
 
-    # Blit isolated Panel (d) cleanly onto main canvas (Guarantees no lines can bleed out)
     canvas[bot_y:bot_y + bot_h, 25:25 + pd_w] = pd_canvas
 
-    # ==========================================================================
-    # PANEL (e): REAL-TIME ROAD STATUS & HAZARD DASHBOARD
-    # ==========================================================================
+    # Panel (e): Real-Time Road Status & Hazard Telemetry
     pe_x = 25 + pd_w + 20
     pe_w = canvas_w - pe_x - 25
     safe_rect(canvas, (pe_x, bot_y), (pe_x + pe_w, bot_y + bot_h), (20, 20, 20), -1)
@@ -837,7 +774,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     card_pad = 18
     cw = pe_w - (card_pad * 2)
 
-    # 1. Forward Corridor Safety Threat Banner
     y_card1 = bot_y + 40
     h_card1 = 58
     safe_rect(canvas, (pe_x + card_pad, y_card1), (pe_x + card_pad + cw, y_card1 + h_card1), (28, 28, 28), -1)
@@ -845,7 +781,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     safe_text(canvas, "FORWARD CORRIDOR INSPECTION", (pe_x + card_pad + 12, y_card1 + 18), 0.34, (180, 180, 180), 1)
     safe_text(canvas, status_text, (pe_x + card_pad + 12, y_card1 + 44), 0.48, alert_color, 2)
 
-    # 2. Autonomous Tactical Maneuver Indicator
     y_card2 = y_card1 + h_card1 + 10
     h_card2 = 52
     ctrl_col = (0, 255, 0) if "AUTOPILOT" in nudge_text else (0, 215, 255)
@@ -854,7 +789,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     safe_text(canvas, "TACTICAL CONTROLLER (INDIAN TRAFFIC FLOW)", (pe_x + card_pad + 12, y_card2 + 18), 0.34, (180, 180, 180), 1)
     safe_text(canvas, nudge_text, (pe_x + card_pad + 12, y_card2 + 40), 0.44, ctrl_col, 2)
 
-    # 3. Intersection Traffic Light Telemetry
     y_card3 = y_card2 + h_card2 + 10
     h_card3 = 58
     safe_rect(canvas, (pe_x + card_pad, y_card3), (pe_x + card_pad + cw, y_card3 + h_card3), (28, 28, 28), -1)
@@ -876,7 +810,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     safe_text(canvas, "INTERSECTION SIGNAL", (tl_box_x + 85, y_card3 + 22), 0.34, (180, 180, 180), 1)
     safe_text(canvas, tl_text, (tl_box_x + 85, y_card3 + 44), 0.46, tl_color, 2)
 
-    # 4. Ego Vehicle Dynamics & Perception Refresh Rate
     y_card4 = y_card3 + h_card3 + 10
     h_card4 = 55
     safe_rect(canvas, (pe_x + card_pad, y_card4), (pe_x + card_pad + cw, y_card4 + h_card4), (24, 24, 24), -1)
@@ -886,7 +819,7 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     safe_text(canvas, "MODE: AUTONOMOUS 20Hz SYNC", (pe_x + card_pad + 14, y_card4 + 44), 0.38, (0, 255, 120), 1)
     safe_text(canvas, "GRID: FOVEATED 2.5D", (pe_x + card_pad + cw // 2 + 10, y_card4 + 44), 0.38, (255, 180, 50), 1)
 
-    # 4. Bottom Footer Bar
+    # Footer Bar
     foot_y = 880
     foot_h = 48
     safe_rect(canvas, (25, foot_y), (canvas_w - 25, foot_y + foot_h), (22, 22, 22), -1)
@@ -897,10 +830,6 @@ def render_lidforge_dashboard(xyz, labels, status_text, alert_color, tl_text, tl
     safe_text(canvas, summary_txt, (108, foot_y + 30), 0.44, (230, 230, 230), 1)
 
     return canvas
-
-# ==============================================================================
-# MAIN SIMULATION PIPELINE
-# ==============================================================================
 
 def main():
     global IS_RUNNING, WORLD_POTHOLE_LOCATIONS
@@ -948,13 +877,11 @@ def main():
     if vehicle is None:
         raise RuntimeError("Failed to acquire ego vehicle.")
 
-    # Configure resilient collision-free autonomous driving
     is_autopilot_active = True
     vehicle.set_autopilot(True, traffic_manager.get_port())
     configure_traffic_manager_safety(traffic_manager, vehicle)
     GLOBAL_CLEANUP_CONTEXT["actors"].append(vehicle)
 
-    # Anchor stationary road potholes along initial vehicle heading
     v_init_tf = vehicle.get_transform()
     v_init_yaw = math.radians(v_init_tf.rotation.yaw)
     fwd_x = math.cos(v_init_yaw)
@@ -971,10 +898,10 @@ def main():
     crossers = spawn_active_forward_crossers(world, vehicle)
     GLOBAL_CLEANUP_CONTEXT["actors"].extend(crossers)
 
-    # High-Density 64-Channel LiDAR Sensor (1,200,000 points/sec for dense detail)
+    # Maximum Density 128-Channel LiDAR Sensor Configuration
     lidar_bp = bp_lib.find("sensor.lidar.ray_cast")
-    lidar_bp.set_attribute("channels", "64")
-    lidar_bp.set_attribute("points_per_second", "1200000")
+    lidar_bp.set_attribute("channels", "128")
+    lidar_bp.set_attribute("points_per_second", "2000000")
     lidar_bp.set_attribute("rotation_frequency", "20")
     lidar_bp.set_attribute("range", "120")
     lidar_bp.set_attribute("upper_fov", "3.0")
@@ -987,9 +914,10 @@ def main():
     lidar_queue = queue.Queue(maxsize=5)
     lidar.listen(lambda data: lidar_callback(data, lidar_queue))
 
-    print("[+] System Active: Running LIDForge Output Dashboard with all features integrated.")
+    print("[+] System Active: Running LIDForge Output Dashboard with Max LiDAR Density and Alternate Rerouting.")
 
     frame_counter = 0
+    stall_counter = 0
     try:
         while IS_RUNNING:
             t0 = time.perf_counter()
@@ -1017,7 +945,6 @@ def main():
             xyz = points[:, :3].copy()
             intensity = np.clip(points[:, 3:4], 0.0, 1.0)
 
-            # Strip ego vehicle chassis returns
             ego_mask = (xyz[:, 0] >= -2.2) & (xyz[:, 0] <= 2.2) & \
                        (xyz[:, 1] >= -1.0) & (xyz[:, 1] <= 1.0) & \
                        (xyz[:, 2] <= 0.2)
@@ -1026,7 +953,6 @@ def main():
 
             xyz = inject_world_anchored_potholes(xyz, vehicle)
 
-            # Voxelize for SpConv 3D U-Net
             voxel_size = 0.05
             coords = np.floor((xyz + [80.0, 80.0, 4.0]) / voxel_size).astype(np.int32)
             valid_mask = (coords[:, 0] >= 0) & (coords[:, 0] < 3200) & \
@@ -1065,9 +991,8 @@ def main():
             fused_labels = extract_dynamic_elevation_features(xyz_valid, raw_preds)
             status_text, alert_color, obstacle_info = inspect_forward_threats(xyz_valid, fused_labels)
 
-            # Collision-free active reactive swerve / braking controller
-            nudge_text, is_autopilot_active = apply_reactive_nudge_control(
-                vehicle, traffic_manager, obstacle_info, xyz_valid, is_autopilot_active
+            nudge_text, is_autopilot_active, stall_counter = apply_reactive_nudge_control(
+                vehicle, traffic_manager, obstacle_info, xyz_valid, is_autopilot_active, stall_counter
             )
 
             tl_text, tl_color = detect_approaching_traffic_signal(world, vehicle, max_dist=25.0)
