@@ -241,6 +241,7 @@ def inject_world_anchored_potholes(xyz, ego_vehicle):
     return xyz
 
 def extract_dynamic_elevation_features(xyz, preds):
+    """Refined classification with strict density checks to eliminate ghost/false pedestrian and vehicle detections."""
     labels = preds.copy()
     x = xyz[:, 0]
     y = xyz[:, 1]
@@ -274,12 +275,20 @@ def extract_dynamic_elevation_features(xyz, preds):
     true_ped_mask = (h_local >= 0.10) & (h_local <= 1.80) & (labels == 2) & (~motorcycle_mask) & (np.abs(y) <= 1.5)
     labels[true_ped_mask] = 2
 
+    # Suppress false tree/vegetation classifications near the road surface
     tree_suppression = (h_local < 1.2) & (labels == 4) & (np.abs(y) < 3.5)
     labels[tree_suppression] = 0
+
+    # Eliminate isolated sparse false positives (ghost detections) for dynamic classes 1 and 2
+    for c_id in [1, 2]:
+        c_indices = np.where(labels == c_id)[0]
+        if len(c_indices) > 0 and len(c_indices) < 12:
+            labels[c_indices] = 0
 
     return labels
 
 def inspect_forward_threats(xyz, labels, range_fwd=(0.5, 14.0), range_lat=(-1.3, 1.3)):
+    """Restricts threat detection strictly to the active driving lane, ignoring sidewalk objects."""
     x = xyz[:, 0]
     y = xyz[:, 1]
     
@@ -442,19 +451,18 @@ def format_signal_state(state, dist):
         return f"SIGNAL: GREEN (GO){dist_str}", (0, 255, 0)
     return "SIGNAL: OFF / CLEAR", (120, 120, 120)
 
-def project_coords(x_val, y_val, z_val, origin_x, origin_y, w, h, max_fwd=75.0, lat_span=16.0, height_scale=10.0):
-    """Pseudo-3D projection for Panel (a) adding height extrusion (z-offset) for volumetric depth."""
+def project_coords(x_val, y_val, z_val, origin_x, origin_y, w, h, max_fwd=90.0, lat_span=16.0, height_scale=10.0):
+    """Pseudo-3D projection with extended length (max_fwd=90m) and height extrusion."""
     norm_x = (float(y_val) / lat_span + 1.0) * 0.5
     norm_y = 1.0 - (float(x_val) / max_fwd)
     screen_x = int(round(origin_x + norm_x * (w - 1)))
-    # Subtracting z_val * height_scale pushes elevated points upwards in screen space for 3D depth
     screen_y = int(round(origin_y + 35 + norm_y * (h - 75) - (float(z_val) * height_scale)))
     screen_x = max(origin_x + 2, min(origin_x + w - 2, screen_x))
     screen_y = max(origin_y + 35, min(origin_y + h - 10, screen_y))
     return screen_x, screen_y
 
-def project_array_3d(x_arr, y_arr, z_arr, origin_x, origin_y, w, h, max_fwd=75.0, lat_span=16.0, height_scale=10.0):
-    """Vectorized pseudo-3D projection for Panel (a) point clouds."""
+def project_array_3d(x_arr, y_arr, z_arr, origin_x, origin_y, w, h, max_fwd=90.0, lat_span=16.0, height_scale=10.0):
+    """Vectorized pseudo-3D projection with extended length (max_fwd=90m)."""
     norm_x = (y_arr / lat_span + 1.0) * 0.5
     norm_y = 1.0 - (x_arr / max_fwd)
     screen_x = (origin_x + norm_x * (w - 1)).astype(np.int32)
@@ -541,8 +549,15 @@ def render_lidforge_dashboard(xyz, z_vals, labels, status_text, alert_color, tl_
     pb_x = pa_x + panel_w + 25
     pc_x = pb_x + panel_w + 25
 
+    max_fwd_a = 90.0  # Extended length for Panel (a)
     max_fwd = 75.0
     lat_span = 16.0
+
+    valid_mask_a = (xyz[:, 0] >= 0.0) & (xyz[:, 0] <= max_fwd_a) & (np.abs(xyz[:, 1]) <= lat_span)
+    x_sub_a = xyz[valid_mask_a, 0]
+    y_sub_a = xyz[valid_mask_a, 1]
+    z_sub_a = z_vals[valid_mask_a]
+    l_sub_a = labels[valid_mask_a]
 
     valid_mask = (xyz[:, 0] >= 0.0) & (xyz[:, 0] <= max_fwd) & (np.abs(xyz[:, 1]) <= lat_span)
     x_sub = xyz[valid_mask, 0]
@@ -550,23 +565,23 @@ def render_lidforge_dashboard(xyz, z_vals, labels, status_text, alert_color, tl_
     z_sub = z_vals[valid_mask]
     l_sub = labels[valid_mask]
 
-    # Panel (a) - Pseudo-3D Point Cloud with height extrusion
+    # Panel (a) - Extended 3D View (90m length)
     safe_rect(canvas, (pa_x, top_y), (pa_x + panel_w, top_y + panel_h), (18, 18, 18), -1)
     safe_rect(canvas, (pa_x, top_y), (pa_x + panel_w, top_y + panel_h), (50, 50, 50), 1)
-    safe_text(canvas, "(a) LiDAR Point Cloud (Pseudo-3D View)", (pa_x + 15, top_y + 24), 0.50, (230, 230, 230), 1)
+    safe_text(canvas, "(a) LiDAR Point Cloud (Extended 3D View)", (pa_x + 15, top_y + 24), 0.50, (230, 230, 230), 1)
 
     cx_pa = pa_x + panel_w // 2
     bot_pa = top_y + panel_h - 35
 
-    for r in [15, 30, 45, 60, 75]:
-        r_px = int((r / max_fwd) * (panel_h - 75))
+    for r in [15, 30, 45, 60, 75, 90]:
+        r_px = int((r / max_fwd_a) * (panel_h - 75))
         safe_circle(canvas, (cx_pa, bot_pa), r_px, (35, 35, 35), 1)
         safe_text(canvas, f"{r}m", (cx_pa + 6, bot_pa - r_px + 12), 0.32, (100, 100, 100), 1)
 
-    sx_a, sy_a = project_array_3d(x_sub, y_sub, z_sub, pa_x, top_y, panel_w, panel_h, max_fwd, lat_span, height_scale=10.0)
+    sx_a, sy_a = project_array_3d(x_sub_a, y_sub_a, z_sub_a, pa_x, top_y, panel_w, panel_h, max_fwd_a, lat_span, height_scale=10.0)
 
     for cls_id in [3, 0, 5, 6, 4, 1, 2, 7]:
-        m = (l_sub == cls_id)
+        m = (l_sub_a == cls_id)
         if not np.any(m):
             continue
         c = COLOR_PALETTE[cls_id]
@@ -575,33 +590,33 @@ def render_lidforge_dashboard(xyz, z_vals, labels, status_text, alert_color, tl_
             canvas[np.clip(sy_a[m] + 1, 0, canvas_h - 1), sx_a[m]] = c
             canvas[sy_a[m], np.clip(sx_a[m] + 1, 0, canvas_w - 1)] = c
 
-    veh_mask = (l_sub == 1) & (x_sub > 8.0)
+    veh_mask = (l_sub_a == 1) & (x_sub_a > 8.0)
     v_px, v_py, vx_m, vy_m = None, None, 30.0, 0.0
     if np.any(veh_mask):
-        vx_m = float(np.median(x_sub[veh_mask]))
-        vy_m = float(np.median(y_sub[veh_mask]))
-        vz_m = float(np.median(z_sub[veh_mask]))
-        v_px, v_py = project_coords(vx_m, vy_m, vz_m, pa_x, top_y, panel_w, panel_h, max_fwd, lat_span, height_scale=10.0)
+        vx_m = float(np.median(x_sub_a[veh_mask]))
+        vy_m = float(np.median(y_sub_a[veh_mask]))
+        vz_m = float(np.median(z_sub_a[veh_mask]))
+        v_px, v_py = project_coords(vx_m, vy_m, vz_m, pa_x, top_y, panel_w, panel_h, max_fwd_a, lat_span, height_scale=10.0)
         safe_rect(canvas, (v_px - 18, v_py - 18), (v_px + 18, v_py + 18), (255, 140, 0), 2)
         safe_text(canvas, f"Vehicle ({int(vx_m)} m)", (v_px - 40, v_py - 22), 0.40, (255, 180, 50), 1)
 
-    ped_mask = (l_sub == 2) & (x_sub > 6.0)
+    ped_mask = (l_sub_a == 2) & (x_sub_a > 6.0)
     p_px, p_py, px_m, py_m = None, None, 50.0, 0.0
     if np.any(ped_mask):
-        px_m = float(np.median(x_sub[ped_mask]))
-        py_m = float(np.median(y_sub[ped_mask]))
-        pz_m = float(np.median(z_sub[ped_mask]))
-        p_px, p_py = project_coords(px_m, py_m, pz_m, pa_x, top_y, panel_w, panel_h, max_fwd, lat_span, height_scale=10.0)
+        px_m = float(np.median(x_sub_a[ped_mask]))
+        py_m = float(np.median(y_sub_a[ped_mask]))
+        pz_m = float(np.median(z_sub_a[ped_mask]))
+        p_px, p_py = project_coords(px_m, py_m, pz_m, pa_x, top_y, panel_w, panel_h, max_fwd_a, lat_span, height_scale=10.0)
         safe_rect(canvas, (p_px - 14, p_py - 14), (p_px + 14, p_py + 14), (0, 0, 255), 2)
         safe_text(canvas, f"Pedestrian ({int(px_m)} m)", (p_px - 44, p_py - 20), 0.40, (120, 120, 255), 1)
 
-    tree_mask = (x_sub > 35.0) & (np.abs(y_sub) > 4.0)
+    tree_mask = (x_sub_a > 35.0) & (np.abs(y_sub_a) > 4.0)
     t_px, t_py, tx_m, ty_m = None, None, 80.0, 9.0
     if np.any(tree_mask):
-        tx_m = float(np.median(x_sub[tree_mask]))
-        ty_m = float(np.median(y_sub[tree_mask]))
-        tz_m = float(np.median(z_sub[tree_mask]))
-        t_px, t_py = project_coords(tx_m, ty_m, tz_m, pa_x, top_y, panel_w, panel_h, max_fwd, lat_span, height_scale=10.0)
+        tx_m = float(np.median(x_sub_a[tree_mask]))
+        ty_m = float(np.median(y_sub_a[tree_mask]))
+        tz_m = float(np.median(z_sub_a[tree_mask]))
+        t_px, t_py = project_coords(tx_m, ty_m, tz_m, pa_x, top_y, panel_w, panel_h, max_fwd_a, lat_span, height_scale=10.0)
         safe_rect(canvas, (t_px - 18, t_py - 18), (t_px + 18, t_py + 18), (0, 215, 255), 2)
         safe_text(canvas, f"Tree ({int(tx_m)} m)", (t_px - 30, t_py - 22), 0.40, (0, 215, 255), 1)
 
@@ -773,7 +788,7 @@ def render_lidforge_dashboard(xyz, z_vals, labels, status_text, alert_color, tl_
         for fx in range(bx1, bx1 + box_w, 10):
             safe_line(pd_canvas, (fx, by1), (fx, by1 + box_h), cinfo["color"], 1)
         for fy in range(by1, by1 + box_h, 10):
-            safe_line(pd_canvas, (bx1, fy), (bx1 + box_h, fy), cinfo["color"], 1)
+            safe_line(pd_canvas, (bx1, fy), (bx1 + box_w, fy), cinfo["color"], 1)
 
         cx_target = cinfo["cx"]
         cy_target = cinfo["cy"]
@@ -883,7 +898,8 @@ def main():
     print(f"[+] Launching on: {torch.cuda.get_device_name(0)}")
 
     window_name = "LIDForge - Output Visualization (Multi-Resolution 2.5D Perception)"
-    cv2.namedWindow(window_name, cv2.WINDOW_AUTOSIZE)
+    # Configured with cv2.WINDOW_NORMAL to allow user window resizing
+    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
 
     model = SpConvUNet(in_channels=1, num_classes=5).to(device)
     if os.path.exists(CHECKPOINT_PATH):
@@ -959,7 +975,7 @@ def main():
     lidar_queue = queue.Queue(maxsize=5)
     lidar.listen(lambda data: lidar_callback(data, lidar_queue))
 
-    print("[+] System Active: Running LIDForge Output Dashboard with Pseudo-3D Panel (a), Safe Waypoint Guidance, and Refined Classification.")
+    print("[+] System Active: Running LIDForge Output Dashboard with Extended 3D View, Window Resizing, and Noise Filtering.")
 
     frame_counter = 0
     stall_counter = 0
