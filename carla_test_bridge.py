@@ -11,6 +11,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# --- IMPORT ADVERSE WEATHER CONDITIONING FILTER ---
+from engine.weather_filter import WeatherConditioningFilter
+
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -32,14 +35,14 @@ CHECKPOINT_PATH = r"checkpoints\spconv_semantickitti_best.pth"
 
 # Semantic Color Palette (BGR)
 COLOR_PALETTE = {
-    0: (40, 40, 40),      # Unclassified / Background (Dark Gray)
-    1: (255, 140, 0),     # Dynamic Vehicles / 2-Wheelers (Dodger Blue)
-    2: (0, 0, 255),       # Pedestrians / Jaywalkers (Vivid Red)
-    3: (34, 139, 34),     # Drivable Road Surface (Forest Green)
-    4: (0, 140, 255),     # Static Obstacles / Barriers (Amber Orange)
-    5: (255, 255, 0),     # Curbs / Median Dividers (Cyan)
-    6: (255, 0, 255),     # Potholes / Road Depressions (Magenta)
-    7: (0, 215, 255),     # Stray Animals / Cattle (Gold)
+    0: (40, 40, 40),       # Unclassified / Background (Dark Gray)
+    1: (255, 140, 0),      # Dynamic Vehicles / 2-Wheelers (Dodger Blue)
+    2: (0, 0, 255),        # Pedestrians / Jaywalkers (Vivid Red)
+    3: (34, 139, 34),      # Drivable Road Surface (Forest Green)
+    4: (0, 140, 255),      # Static Obstacles / Barriers (Amber Orange)
+    5: (255, 255, 0),      # Curbs / Median Dividers (Cyan)
+    6: (255, 0, 255),      # Potholes / Road Depressions (Magenta)
+    7: (0, 215, 255),      # Stray Animals / Cattle (Gold)
 }
 
 IS_RUNNING = True
@@ -164,7 +167,7 @@ def inject_world_potholes(xyz, ego_vehicle):
     return xyz
 
 # ==============================================================================
-# PERCEPTION, CURB-GATING & TRUE DYNAMIC CLUSTERING (NO GHOST DETECTIONS)
+# PERCEPTION, CURB-GATING & TRUE DYNAMIC CLUSTERING
 # ==============================================================================
 def extract_elevation_features(xyz, preds):
     labels = preds.copy()
@@ -214,7 +217,6 @@ def extract_elevation_features(xyz, preds):
     grid_dim = 140
     occ_grid = np.zeros((grid_dim, grid_dim), dtype=np.uint8)
 
-    # ONLY cluster dynamic candidate points; exclude static obstacles and vegetation
     dynamic_candidate_pts = (labels == 1) | (labels == 2) | (labels == 7)
     if np.any(dynamic_candidate_pts):
         ox = np.clip((x[dynamic_candidate_pts] / 48.0 * (grid_dim - 1)).astype(np.int32), 0, grid_dim - 1)
@@ -231,7 +233,6 @@ def extract_elevation_features(xyz, preds):
             cx_m = (centroids[i][1] / (grid_dim - 1)) * 48.0
             cy_m = (centroids[i][0] / (grid_dim - 1)) * 48.0 - 24.0
 
-            # Reject clusters outside roadway bounds (sidewalks, yards, fences)
             if abs(cy_m) > 3.6:
                 continue
 
@@ -249,12 +250,11 @@ def extract_elevation_features(xyz, preds):
             dist = math.hypot(cx_m, cy_m)
             bbox = (float(np.min(x[c_mask])), float(np.max(x[c_mask])), float(np.min(y[c_mask])), float(np.max(y[c_mask])))
 
-            # Sidewalk check: must have tire/foot ground contact
             if h_base > 0.14 or h_base < -0.18:
                 labels[c_mask] = 4
                 continue
 
-            # Real Vehicle Filter: length 1.2m-5.8m, width 0.7m-2.6m, height 0.6m-2.5m
+            # Vehicle Filter
             if 1.2 <= dx <= 5.8 and 0.7 <= dy <= 2.6 and 0.6 <= h_span <= 2.5 and pts_count >= 16:
                 labels[c_mask] = 1
                 clusters.append({
@@ -265,7 +265,7 @@ def extract_elevation_features(xyz, preds):
                     "dist": dist,
                     "color": (255, 140, 0)
                 })
-            # Real Pedestrian / Jaywalker Filter: width <= 1.3m, height 0.8m-2.1m
+            # Pedestrian Filter
             elif dx <= 1.3 and dy <= 1.3 and 0.8 <= h_span <= 2.1 and pts_count >= 10:
                 labels[c_mask] = 2
                 clusters.append({
@@ -277,7 +277,6 @@ def extract_elevation_features(xyz, preds):
                     "color": (0, 0, 255)
                 })
             else:
-                # Curbs, low walls, and debris remain static obstacles without boxes
                 labels[c_mask] = 4
 
     return labels, clusters
@@ -463,7 +462,6 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
                 for dx_ in [-1, 0, 1]:
                     canvas[np.clip(py_a[dyn_m] + dy, top_y + 32, cy_a), np.clip(px_a[dyn_m] + dx_, pa_x1 + 1, pa_x2 - 2)] = (255, 140, 0)
 
-    # Render bounding boxes ONLY on real verified clusters
     for c in clusters:
         xmin, xmax, ymin, ymax = c["bbox"]
         bx1 = np.clip(int(((ymin / range_lat_a) * (panel_w // 2) + cx_a)), pa_x1 + 2, pa_x2 - 2)
@@ -496,14 +494,12 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
 
     cx_b, cy_b = (pb_x1 + pb_x2) // 2, p_y2 - 38
 
-    # Base Far Grid (60cm coarse)
     grid_spacing = 28
     for gx in range(pb_x1 + 4, pb_x2 - 4, grid_spacing):
         draw_line(canvas, (gx, top_y + 35), (gx, cy_b), (50, 40, 15), 1)
     for gy in range(top_y + 40, cy_b, grid_spacing):
         draw_line(canvas, (pb_x1 + 4, gy), (pb_x2 - 4, gy), (50, 40, 15), 1)
 
-    # Base Near Grid (5cm fine)
     near_top = int(cy_b - (20.0 / range_fwd_a) * (panel_h - 70))
     near_x1 = int(cx_b - (14.0 / range_lat_a) * (panel_w // 2))
     near_x2 = int(cx_b + (14.0 / range_lat_a) * (panel_w // 2))
@@ -522,7 +518,6 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
         canvas[py_b[obs_m], px_b[obs_m]] = (255, 200, 0)
         canvas[py_b[dyn_m], px_b[dyn_m]] = (255, 140, 0)
 
-    # Adaptive refinement sub-grids ONLY on real verified clusters
     for c in clusters:
         xmin, xmax, ymin, ymax = c["bbox"]
         bx1 = np.clip(int(((ymin / range_lat_a) * (panel_w // 2) + cx_b)), pb_x1 + 4, pb_x2 - 4)
@@ -595,7 +590,6 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
     draw_text(canvas, "(e) Real-Time Road Status, Hazard Telemetry & Latency Profiler",
               (pe_x1 + 18, pe_y1 + 24), 0.48, (220, 220, 220), 1)
 
-    # Card 1: Forward Safety Corridor & Tactical Planner
     c1_w = 460
     draw_rect(canvas, (pe_x1 + 18, pe_y1 + 38), (pe_x1 + 18 + c1_w, pe_y2 - 16), (18, 18, 18), -1)
     draw_rect(canvas, (pe_x1 + 18, pe_y1 + 38), (pe_x1 + 18 + c1_w, pe_y2 - 16), (45, 45, 45), 1)
@@ -605,12 +599,11 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
     draw_rect(canvas, (pe_x1 + 30, pe_y1 + 68), (pe_x1 + c1_w + 6, pe_y1 + 128), status_col, 2)
     draw_text(canvas, status_text, (pe_x1 + 44, pe_y1 + 104), 0.52, status_col, 2)
 
-    draw_text(canvas, "TACTICAL CONTROLLER (INDIAN TRAFFIC FLOW)", (pe_x1 + 32, pe_y1 + 154), 0.38, (180, 180, 180), 1)
+    draw_text(canvas, "TACTICAL CONTROLLER (TRAFFIC FLOW / DEFENSE UGV)", (pe_x1 + 32, pe_y1 + 154), 0.38, (180, 180, 180), 1)
     draw_rect(canvas, (pe_x1 + 30, pe_y1 + 162), (pe_x1 + c1_w + 6, pe_y1 + 222), (22, 22, 22), -1)
     draw_rect(canvas, (pe_x1 + 30, pe_y1 + 162), (pe_x1 + c1_w + 6, pe_y1 + 222), tactic_col, 2)
     draw_text(canvas, tactic_text, (pe_x1 + 44, pe_y1 + 198), 0.48, tactic_col, 2)
 
-    # Card 2: Intersection Signal & Danger Matrix
     c2_x1 = pe_x1 + 18 + c1_w + 18
     c2_w = 390
     c2_x2 = c2_x1 + c2_w
@@ -636,7 +629,6 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
         draw_rect(canvas, (sx, pe_y1 + 168), (sx + 104, pe_y1 + 218), s_col, 2)
         draw_text(canvas, s_name, (sx + 24, pe_y1 + 198), 0.44, s_col, 1)
 
-    # Card 3: Live Telemetry & Latency Profiler
     c3_x1 = c2_x2 + 18
     c3_x2 = pe_x2 - 18
     draw_rect(canvas, (c3_x1, pe_y1 + 38), (c3_x2, pe_y2 - 16), (18, 18, 18), -1)
@@ -663,7 +655,7 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
     return canvas
 
 # ==============================================================================
-# MAIN PERCEPTION & SIMULATION PIPELINE (STABLE TOWN01 ENFORCEMENT)
+# MAIN PERCEPTION & SIMULATION PIPELINE
 # ==============================================================================
 def main():
     global IS_RUNNING, WORLD_POTHOLE_LOCATIONS
@@ -675,7 +667,10 @@ def main():
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1600, 930)
 
-    # 1. Neural Model Setup
+    # 1. Instantiate Weather Conditioning Filter
+    weather_filter = WeatherConditioningFilter(min_intensity=0.08)
+
+    # 2. Neural Model Setup
     model = SpConvUNet(in_channels=1, num_classes=5).to(device)
     if os.path.exists(CHECKPOINT_PATH):
         model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
@@ -686,9 +681,7 @@ def main():
 
     tactical_planner = TacticalGuidanceController()
 
-    # ==============================================================================
-    # 2. CONNECT TO CARLA AND FORCE TOWN01
-    # ==============================================================================
+    # 3. CONNECT TO CARLA
     client = carla.Client("127.0.0.1", 2000)
     client.set_timeout(120.0)
     GLOBAL_CLEANUP_CONTEXT["client"] = client
@@ -721,10 +714,26 @@ def main():
 
     print("[✓] Town10HD successfully loaded.")
     GLOBAL_CLEANUP_CONTEXT["world"] = world
+
+    # ==============================================================================
+    # 4. ADVERSE WEATHER CONFIGURATION (TESTING DEGRADED VISUAL ENVIRONMENTS)
+    # ==============================================================================
+    adverse_weather = carla.WeatherParameters(
+        cloudiness=90.0,
+        precipitation=80.0,          # Heavy rainfall
+        precipitation_deposits=70.0, # Water accumulation / puddles
+        fog_density=60.0,            # Dense fog
+        fog_distance=10.0,           # Fog starts 10m from sensor
+        wetness=80.0,
+        sun_altitude_angle=15.0      # Overcast lighting
+    )
+    world.set_weather(adverse_weather)
+    print("[✓] Adverse Weather Applied: Rain, Fog & Wet Ground")
+
     world_map = world.get_map()
     spectator = world.get_spectator()
 
-    # Synchronous Master Mode: 20 Hz / 50 ms fixed delta.
+    # Synchronous Master Mode: 20 Hz / 50 ms fixed delta
     settings = world.get_settings()
     settings.synchronous_mode = True
     settings.fixed_delta_seconds = 0.05
@@ -738,8 +747,7 @@ def main():
     print("[✓] Town10HD synchronous mode enabled at 20 Hz.")
     print("[✓] Traffic Manager synchronized on port 8000.")
 
-    # 3. Spawn Ego Vehicle + Indian Traffic Profile
-    # ==============================================================================
+    # 5. Spawn Ego Vehicle + Traffic Profile
     bp_lib = world.get_blueprint_library()
     vehicle_bp = bp_lib.filter("vehicle.tesla.model3")[0]
     spawn_points = world_map.get_spawn_points()
@@ -762,7 +770,6 @@ def main():
     GLOBAL_CLEANUP_CONTEXT["actors"].append(vehicle)
 
     def spawn_indian_traffic_profile():
-        """Spawn heterogeneous traffic representative of dense Indian roads."""
         requested = [
             "vehicle.yamaha.yzf", "vehicle.vespa.zx125", "vehicle.kawasaki.ninja",
             "vehicle.audi.a2", "vehicle.nissan.micra",
@@ -773,8 +780,6 @@ def main():
             if name in available:
                 selected.append(available[name])
 
-        # Fill remaining slots with ordinary passenger vehicles if a CARLA version
-        # does not ship one of the requested Indian-profile blueprint names.
         fallback = [bp for bp in bp_lib.filter("vehicle.*") if bp.id != vehicle_bp.id]
         np.random.shuffle(fallback)
         traffic_bps = (selected + fallback)[:18]
@@ -804,75 +809,12 @@ def main():
                 pass
             GLOBAL_CLEANUP_CONTEXT["actors"].append(actor)
             spawned.append(actor)
-        print(f"[+] Indian traffic profile: {len(spawned)} AI vehicles spawned.")
-        return spawned
-
-    def spawn_pedestrians(count=12):
-        """Spawn AI walkers for jaywalking / unstructured pedestrian tests."""
-        walker_bps = bp_lib.filter("walker.pedestrian.*")
-        controller_bp = bp_lib.find("controller.ai.walker") if walker_bps else None
-        if not walker_bps or controller_bp is None:
-            print("[!] Walker blueprints unavailable; pedestrian suite skipped.")
-            return []
-
-        walkers = []
-        controllers = []
-        attempts = 0
-        while len(walkers) < count and attempts < count * 5:
-            attempts += 1
-            loc = world.get_random_location_from_navigation()
-            if loc is None:
-                continue
-            bp = walker_bps[np.random.randint(0, len(walker_bps))]
-            walker = world.try_spawn_actor(bp, carla.Transform(loc))
-            if walker is None:
-                continue
-            controller = world.spawn_actor(controller_bp, carla.Transform(), attach_to=walker)
-            GLOBAL_CLEANUP_CONTEXT["actors"].extend([walker, controller])
-            walkers.append(walker)
-            controllers.append(controller)
-
-        for controller in controllers:
-            try:
-                controller.start()
-                target = world.get_random_location_from_navigation()
-                if target is not None:
-                    controller.go_to_location(target)
-                controller.set_max_speed(float(np.random.uniform(1.0, 1.8)))
-            except Exception:
-                pass
-
-        print(f"[+] Indian pedestrian/jaywalking profile: {len(walkers)} AI walkers spawned.")
-        return walkers
-
-    def spawn_optional_animals(count=4):
-        """Use native CARLA animal assets when the installed content package has them."""
-        animal_bps = []
-        for bp in bp_lib.filter("*"):
-            ident = bp.id.lower()
-            if any(token in ident for token in ("cow", "cattle", "dog", "sheep", "goat")):
-                animal_bps.append(bp)
-        if not animal_bps:
-            print("[!] No native cattle/dog/sheep/goat CARLA assets found; class-7 logic remains active for incoming geometry.")
-            return []
-        spawned = []
-        for _ in range(count):
-            loc = world.get_random_location_from_navigation()
-            if loc is None:
-                continue
-            bp = animal_bps[np.random.randint(0, len(animal_bps))]
-            actor = world.try_spawn_actor(bp, carla.Transform(loc))
-            if actor is not None:
-                GLOBAL_CLEANUP_CONTEXT["actors"].append(actor)
-                spawned.append(actor)
-        print(f"[+] Optional animal profile: {len(spawned)} native animal actors spawned.")
+        print(f"[+] Traffic profile: {len(spawned)} AI vehicles spawned.")
         return spawned
 
     spawn_indian_traffic_profile()
-    spawn_pedestrians(12)
-    spawn_optional_animals(4)
 
-    # 4. Anchor Stationary Road Potholes in Front of Ego in Town10HD
+    # 6. Anchor Stationary Road Potholes
     v_init_tf = vehicle.get_transform()
     v_init_yaw = math.radians(v_init_tf.rotation.yaw)
     fx = math.cos(v_init_yaw)
@@ -884,7 +826,7 @@ def main():
         (v_init_tf.location.x + fx * 65.0, v_init_tf.location.y + fy * 65.0, 0.80, 0.14)
     ]
 
-    # 5. Attach 64-Channel LiDAR Sensor
+    # 7. Attach 64-Channel LiDAR Sensor
     lidar_bp = bp_lib.find("sensor.lidar.ray_cast")
     lidar_bp.set_attribute("channels", "64")
     lidar_bp.set_attribute("points_per_second", "600000")
@@ -922,8 +864,12 @@ def main():
                         break
                     continue
 
-            # Start end-to-end perception timing after the simulator tick and sensor wait.
             pipeline_t0 = time.perf_counter()
+
+            # ==================================================================
+            # 8. APPLY WEATHER DE-NOISING FILTER TO RAW LIDAR INGEST
+            # ==================================================================
+            points = weather_filter.apply(points)
 
             # Strip ego vehicle chassis returns
             xyz = points[:, :3].copy()
@@ -990,7 +936,7 @@ def main():
                     raw_preds = torch.argmax(logits, dim=-1).cpu().numpy()
             t_sp = (time.perf_counter() - t_sp_0) * 1000.0
 
-            # Curb-Contact Constraint & True Dynamic Clustering (NO GHOST OBJECTS)
+            # Curb-Contact Constraint & Dynamic Clustering
             t_gate_0 = time.perf_counter()
             fused_labels, clusters = extract_elevation_features(xyz_valid, raw_preds)
             t_gate = (time.perf_counter() - t_gate_0) * 1000.0
