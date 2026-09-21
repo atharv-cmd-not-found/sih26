@@ -11,6 +11,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+# --- IMPORT ADVERSE WEATHER CONDITIONING FILTER ---
+from engine.weather_filter import WeatherConditioningFilter
+
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -29,17 +32,26 @@ except ImportError:
             return self.linear(x_sp.features)
 
 CHECKPOINT_PATH = r"checkpoints\spconv_semantickitti_best.pth"
+LIDAR_FRAME_RATE_HZ = 20
+LIDAR_POINTS_PER_FRAME = 30000
+WEATHER_DURATION_SECONDS = 10.0
+GROUND_RETURN_KEEP_PROBABILITY = 0.75
+LIDAR_VOXEL_SIZE = 0.08
+PERCEPTION_FORWARD_RANGE = 80.0
+PERCEPTION_LATERAL_RANGE = 32.0
+PERCEPTION_Z_MIN = -2.8
+PERCEPTION_Z_MAX = 3.2
 
 # Semantic Color Palette (BGR)
 COLOR_PALETTE = {
-    0: (40, 40, 40),      # Unclassified / Background (Dark Gray)
-    1: (255, 140, 0),     # Dynamic Vehicles / 2-Wheelers (Dodger Blue)
-    2: (0, 0, 255),       # Pedestrians / Jaywalkers (Vivid Red)
-    3: (34, 139, 34),     # Drivable Road Surface (Forest Green)
-    4: (0, 140, 255),     # Static Obstacles / Barriers (Amber Orange)
-    5: (255, 255, 0),     # Curbs / Median Dividers (Cyan)
-    6: (255, 0, 255),     # Potholes / Road Depressions (Magenta)
-    7: (0, 215, 255),     # Stray Animals / Cattle (Gold)
+    0: (40, 40, 40),       # Unclassified / Background (Dark Gray)
+    1: (255, 140, 0),      # Dynamic Vehicles / 2-Wheelers (Dodger Blue)
+    2: (0, 0, 255),        # Pedestrians / Jaywalkers (Vivid Red)
+    3: (34, 139, 34),      # Drivable Road Surface (Forest Green)
+    4: (0, 140, 255),      # Static Obstacles / Barriers (Amber Orange)
+    5: (255, 255, 0),      # Curbs / Median Dividers (Cyan)
+    6: (255, 0, 255),      # Potholes / Road Depressions (Magenta)
+    7: (0, 215, 255),      # Stray Animals / Cattle (Gold)
 }
 
 IS_RUNNING = True
@@ -185,6 +197,69 @@ def update_spectator_follow_cam(spectator, vehicle):
     except Exception:
         pass
 
+def weather_for_condition(condition):
+    presets = {
+        "snowfall": carla.WeatherParameters(
+            cloudiness=95.0,
+            precipitation=100.0,
+            precipitation_deposits=75.0,
+            fog_density=20.0,
+            fog_distance=25.0,
+            wetness=65.0,
+            sun_altitude_angle=10.0,
+        ),
+        "rain": carla.WeatherParameters(
+            cloudiness=90.0,
+            precipitation=85.0,
+            precipitation_deposits=70.0,
+            fog_density=35.0,
+            fog_distance=18.0,
+            wetness=85.0,
+            sun_altitude_angle=15.0,
+        ),
+        "fog": carla.WeatherParameters(
+            cloudiness=70.0,
+            precipitation=0.0,
+            precipitation_deposits=0.0,
+            fog_density=85.0,
+            fog_distance=8.0,
+            wetness=20.0,
+            sun_altitude_angle=25.0,
+        ),
+        "dust": carla.WeatherParameters(
+            cloudiness=45.0,
+            precipitation=0.0,
+            precipitation_deposits=0.0,
+            fog_density=35.0,
+            fog_distance=15.0,
+            wetness=0.0,
+            wind_intensity=80.0,
+            dust_storm=90.0,
+            sun_altitude_angle=35.0,
+        ),
+        "smoke": carla.WeatherParameters(
+            cloudiness=60.0,
+            precipitation=0.0,
+            precipitation_deposits=0.0,
+            fog_density=75.0,
+            fog_distance=6.0,
+            wetness=0.0,
+            wind_intensity=10.0,
+            dust_storm=35.0,
+            sun_altitude_angle=20.0,
+        ),
+    }
+    return presets[condition]
+
+def update_dynamic_weather(world, elapsed_seconds, current_index):
+    conditions = ("snowfall", "rain", "fog", "dust", "smoke")
+    next_index = int(elapsed_seconds // WEATHER_DURATION_SECONDS) % len(conditions)
+    if next_index != current_index:
+        condition = conditions[next_index]
+        world.set_weather(weather_for_condition(condition))
+        print(f"[✓] Dynamic weather: {condition} ({WEATHER_DURATION_SECONDS:.0f}s)")
+    return next_index
+
 def inject_world_potholes(xyz, ego_vehicle):
     global WORLD_POTHOLE_LOCATIONS
     if len(xyz) == 0 or len(WORLD_POTHOLE_LOCATIONS) == 0:
@@ -259,8 +334,8 @@ def extract_elevation_features(xyz, preds):
 
     dynamic_candidate_pts = (labels == 1) | (labels == 2) | (labels == 7) | ((labels == 4) & (h_local > 0.5) & (h_local < 2.0) & (np.abs(y) <= 3.6))
     if np.any(dynamic_candidate_pts):
-        ox = np.clip((x[dynamic_candidate_pts] / 48.0 * (grid_dim - 1)).astype(np.int32), 0, grid_dim - 1)
-        oy = np.clip(((y[dynamic_candidate_pts] + 24.0) / 48.0 * (grid_dim - 1)).astype(np.int32), 0, grid_dim - 1)
+        ox = np.clip((x[dynamic_candidate_pts] / PERCEPTION_FORWARD_RANGE * (grid_dim - 1)).astype(np.int32), 0, grid_dim - 1)
+        oy = np.clip(((y[dynamic_candidate_pts] + PERCEPTION_LATERAL_RANGE) / (2.0 * PERCEPTION_LATERAL_RANGE) * (grid_dim - 1)).astype(np.int32), 0, grid_dim - 1)
         occ_grid[ox, oy] = 255
 
         num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(occ_grid, connectivity=8)
@@ -270,8 +345,8 @@ def extract_elevation_features(xyz, preds):
             if area < 3:
                 continue
 
-            cx_m = (centroids[i][1] / (grid_dim - 1)) * 48.0
-            cy_m = (centroids[i][0] / (grid_dim - 1)) * 48.0 - 24.0
+            cx_m = (centroids[i][1] / (grid_dim - 1)) * PERCEPTION_FORWARD_RANGE
+            cy_m = (centroids[i][0] / (grid_dim - 1)) * (2.0 * PERCEPTION_LATERAL_RANGE) - PERCEPTION_LATERAL_RANGE
 
             if abs(cy_m) > 4.2:
                 continue
@@ -563,14 +638,12 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
 
     cx_b, cy_b = (pb_x1 + pb_x2) // 2, p_y2 - 38
 
-    # Base Far Grid (60cm coarse)
     grid_spacing = 28
     for gx in range(pb_x1 + 4, pb_x2 - 4, grid_spacing):
         draw_line(canvas, (gx, top_y + 35), (gx, cy_b), (50, 40, 15), 1)
     for gy in range(top_y + 40, cy_b, grid_spacing):
         draw_line(canvas, (pb_x1 + 4, gy), (pb_x2 - 4, gy), (50, 40, 15), 1)
 
-    # Base Near Grid (5cm fine)
     near_top = int(cy_b - (20.0 / range_fwd_a) * (panel_h - 70))
     near_x1 = int(cx_b - (14.0 / range_lat_a) * (panel_w // 2))
     near_x2 = int(cx_b + (14.0 / range_lat_a) * (panel_w // 2))
@@ -668,7 +741,6 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
     draw_text(canvas, "(e) Real-Time Road Status, Hazard Telemetry & Latency Profiler",
               (pe_x1 + 18, pe_y1 + 24), 0.48, (220, 220, 220), 1)
 
-    # Card 1: Forward Safety Corridor & Tactical Planner
     c1_w = 460
     draw_rounded_rect(canvas, (pe_x1 + 18, pe_y1 + 38), (pe_x1 + 18 + c1_w, pe_y2 - 16), (18, 18, 18), radius=5, thickness=-1)
     draw_rounded_rect(canvas, (pe_x1 + 18, pe_y1 + 38), (pe_x1 + 18 + c1_w, pe_y2 - 16), (45, 45, 45), radius=5, thickness=1)
@@ -683,7 +755,6 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
     draw_rounded_rect(canvas, (pe_x1 + 30, pe_y1 + 162), (pe_x1 + c1_w + 6, pe_y1 + 222), tactic_col, radius=4, thickness=2)
     draw_text(canvas, tactic_text, (pe_x1 + 44, pe_y1 + 198), 0.48, tactic_col, 2)
 
-    # Card 2: Intersection Signal & Danger Matrix
     c2_x1 = pe_x1 + 18 + c1_w + 18
     c2_w = 390
     c2_x2 = c2_x1 + c2_w
@@ -709,7 +780,6 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
         draw_rounded_rect(canvas, (sx, pe_y1 + 168), (sx + 104, pe_y1 + 218), s_col, radius=4, thickness=2)
         draw_text(canvas, s_name, (sx + 24, pe_y1 + 198), 0.44, s_col, 1)
 
-    # Card 3: Live Telemetry & Latency Profiler
     c3_x1 = c2_x2 + 18
     c3_x2 = pe_x2 - 18
     draw_rounded_rect(canvas, (c3_x1, pe_y1 + 38), (c3_x2, pe_y2 - 16), (18, 18, 18), radius=5, thickness=-1)
@@ -747,7 +817,10 @@ def main():
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(window_name, 1600, 930)
 
-    # 1. Neural Model Setup
+    # 1. Instantiate Weather Conditioning Filter
+    weather_filter = WeatherConditioningFilter(min_intensity=0.08)
+
+    # 2. Neural Model Setup
     model = SpConvUNet(in_channels=1, num_classes=5).to(device)
     if os.path.exists(CHECKPOINT_PATH):
         model.load_state_dict(torch.load(CHECKPOINT_PATH, map_location=device))
@@ -786,6 +859,13 @@ def main():
         print(f"[✓] CARLA verified active on: {active_map}")
 
     GLOBAL_CLEANUP_CONTEXT["world"] = world
+
+    # ================================================================================
+    # 4. DYNAMIC WEATHER CONFIGURATION (10 SECONDS PER CONDITION)
+    # ================================================================================
+    weather_index = -1
+    weather_index = update_dynamic_weather(world, 0.0, weather_index)
+
     world_map = world.get_map()
     spectator = world.get_spectator()
 
@@ -833,11 +913,11 @@ def main():
         (v_init_tf.location.x + fx * 65.0, v_init_tf.location.y + fy * 65.0, 0.80, 0.14)
     ]
 
-    # 5. Attach 64-Channel LiDAR Sensor
+    # 7. Attach 64-Channel LiDAR Sensor (30,000 points per 20 Hz frame)
     lidar_bp = bp_lib.find("sensor.lidar.ray_cast")
     lidar_bp.set_attribute("channels", "64")
-    lidar_bp.set_attribute("points_per_second", "600000")
-    lidar_bp.set_attribute("rotation_frequency", "20")
+    lidar_bp.set_attribute("points_per_second", str(LIDAR_POINTS_PER_FRAME * LIDAR_FRAME_RATE_HZ))
+    lidar_bp.set_attribute("rotation_frequency", str(LIDAR_FRAME_RATE_HZ))
     lidar_bp.set_attribute("range", "120")
     lidar_bp.set_attribute("upper_fov", "3.0")
     lidar_bp.set_attribute("lower_fov", "-25.0")
@@ -856,6 +936,11 @@ def main():
         while IS_RUNNING:
             t0 = time.perf_counter()
             world.tick()
+            weather_index = update_dynamic_weather(
+                world,
+                world.get_snapshot().timestamp.elapsed_seconds,
+                weather_index,
+            )
             update_spectator_follow_cam(spectator, vehicle)
             frame_idx += 1
 
@@ -889,19 +974,19 @@ def main():
             if len(xyz_roi) == 0:
                 continue
 
-            # Ground Decimation (Drop 65% of flat asphalt returns)
+            # Retain most ground returns so the dashboard shows the higher density.
             ground_est = -1.85
             is_flat_asphalt = (np.abs(xyz_roi[:, 2] - ground_est) < 0.05) & (xyz_roi[:, 0] > 4.0)
-            keep_mask = ~is_flat_asphalt | (np.random.rand(len(xyz_roi)) > 0.65)
+            keep_mask = ~is_flat_asphalt | (np.random.rand(len(xyz_roi)) < GROUND_RETURN_KEEP_PROBABILITY)
             xyz_sub = xyz_roi[keep_mask]
             intensity_sub = intensity_roi[keep_mask]
 
             # 64-bit Packed Voxel Deduplication (< 0.6 ms)
             t_dedup_0 = time.perf_counter()
-            voxel_size = 0.12
+            voxel_size = LIDAR_VOXEL_SIZE
             ix = (xyz_sub[:, 0] / voxel_size).astype(np.uint64)
-            iy = ((xyz_sub[:, 1] + 24.0) / voxel_size).astype(np.uint64)
-            iz = ((xyz_sub[:, 2] + 2.8) / voxel_size).astype(np.uint64)
+            iy = ((xyz_sub[:, 1] + PERCEPTION_LATERAL_RANGE) / voxel_size).astype(np.uint64)
+            iz = ((xyz_sub[:, 2] - PERCEPTION_Z_MIN) / voxel_size).astype(np.uint64)
             packed_keys = (ix << 32) | (iy << 16) | iz
 
             _, u_idx = np.unique(packed_keys, return_index=True)
@@ -910,8 +995,8 @@ def main():
             t_dedup = (time.perf_counter() - t_dedup_0) * 1000.0
 
             coords_x = (xyz_valid[:, 0] / voxel_size).astype(np.int32)
-            coords_y = ((xyz_valid[:, 1] + 24.0) / voxel_size).astype(np.int32)
-            coords_z = ((xyz_valid[:, 2] + 2.8) / voxel_size).astype(np.int32)
+            coords_y = ((xyz_valid[:, 1] + PERCEPTION_LATERAL_RANGE) / voxel_size).astype(np.int32)
+            coords_z = ((xyz_valid[:, 2] - PERCEPTION_Z_MIN) / voxel_size).astype(np.int32)
             coords_b = np.stack([np.zeros(len(coords_x), dtype=np.int32), coords_x, coords_y, coords_z], axis=-1)
 
             t_coords = torch.from_numpy(coords_b).to(device=device, dtype=torch.int32).contiguous()
@@ -920,7 +1005,11 @@ def main():
             x_sp = spconv.SparseConvTensor(
                 features=t_feats,
                 indices=t_coords,
-                spatial_shape=[420, 420, 55],
+                spatial_shape=[
+                    int(PERCEPTION_FORWARD_RANGE / voxel_size) + 1,
+                    int((2.0 * PERCEPTION_LATERAL_RANGE) / voxel_size) + 1,
+                    int((PERCEPTION_Z_MAX - PERCEPTION_Z_MIN) / voxel_size) + 1,
+                ],
                 batch_size=1
             )
 
