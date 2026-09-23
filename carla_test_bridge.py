@@ -6,13 +6,23 @@ import signal
 import atexit
 import warnings
 import queue
+import base64
+from pathlib import Path
+import tkinter as tk
+from tkinter import ttk
 import cv2
 import numpy as np
 import torch
 import torch.nn as nn
 
+if os.name == "nt":
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
 # --- IMPORT ADVERSE WEATHER CONDITIONING FILTER ---
-from engine.weather_filter import WeatherConditioningFilter
+from models.weather_filter import WeatherConditioningFilter
+from sumo_bridge import SumoIndianTraffic
 
 warnings.filterwarnings("ignore")
 os.environ["PYTHONWARNINGS"] = "ignore"
@@ -32,10 +42,12 @@ except ImportError:
             return self.linear(x_sp.features)
 
 CHECKPOINT_PATH = r"checkpoints\spconv_semantickitti_best.pth"
+TARGET_CARLA_MAP = "Town10HD_Opt"
 LIDAR_FRAME_RATE_HZ = 20
-LIDAR_POINTS_PER_FRAME = 30000
+LIDAR_POINTS_PER_FRAME = 60000
+MODEL_POINTS_PER_FRAME = 12000
 WEATHER_DURATION_SECONDS = 10.0
-GROUND_RETURN_KEEP_PROBABILITY = 0.75
+GROUND_RETURN_KEEP_PROBABILITY = 1.0
 LIDAR_VOXEL_SIZE = 0.08
 PERCEPTION_FORWARD_RANGE = 80.0
 PERCEPTION_LATERAL_RANGE = 32.0
@@ -61,8 +73,157 @@ GLOBAL_CLEANUP_CONTEXT = {
     "world": None,
     "traffic_manager": None,
     "actors": [],
+    "walkthrough_writer": None,
     "cleaned": False
 }
+SUMO_TRAFFIC = None
+VIEW_SELECTOR = None
+OUTPUT_SELECTOR = None
+WALKTHROUGH_DURATION_SECONDS = 60.0
+WALKTHROUGH_PANEL_SECONDS = 15.0
+WALKTHROUGH_VIDEO_FPS = 20
+
+
+class OutputModeSelector:
+    def __init__(self):
+        self.root = tk.Tk()
+        self.root.title("LIDForge Output")
+        self.root.geometry("250x92")
+        self.root.resizable(False, False)
+        self.closed = False
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.configure(bg="#151515")
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure("Output.TFrame", background="#151515")
+        style.configure("Output.TLabel", background="#151515", foreground="#eeeeee", font=("Segoe UI", 10))
+        frame = ttk.Frame(self.root, style="Output.TFrame", padding=12)
+        frame.pack(fill="both", expand=True)
+        ttk.Label(frame, text="OUTPUT VIEW", style="Output.TLabel").pack(anchor="w")
+        self.value = tk.StringVar(value="LiDAR")
+        self.combo = ttk.Combobox(
+            frame,
+            textvariable=self.value,
+            values=("LiDAR", "Height Map", "2.5D Grid", "Telemetry"),
+            state="readonly",
+            width=25,
+        )
+        self.combo.pack(fill="x", pady=(5, 0))
+        self.root.update_idletasks()
+
+    def update(self):
+        if self.closed:
+            return None
+        try:
+            self.root.update()
+            return {"LiDAR": 1, "Height Map": 2, "2.5D Grid": 3, "Telemetry": 4}.get(self.value.get(), 1)
+        except tk.TclError:
+            self.closed = True
+            return None
+
+    def close(self):
+        self.closed = True
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
+
+
+class DashboardViewSelector:
+    def __init__(self, initial_mode=1):
+        self.root = tk.Tk()
+        self.root.title("LIDForge | Foveated Road Perception")
+        self.root.geometry("1000x650")
+        self.root.minsize(720, 480)
+        self.closed = False
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
+        self.root.configure(bg="#101418")
+        self.mode_by_name = {
+            "LiDAR": 1,
+            "Grid": 2,
+            "Height Map": 3,
+            "Telemetry": 4,
+        }
+        self.selected = tk.StringVar(value="LiDAR")
+        style = ttk.Style(self.root)
+        style.theme_use("clam")
+        style.configure("Top.TFrame", background="#101418")
+        style.configure("Title.TLabel", background="#101418", foreground="#f2b84b", font=("Segoe UI", 16, "bold"))
+        style.configure("Meta.TLabel", background="#101418", foreground="#9aa6b2", font=("Segoe UI", 10))
+        style.configure("Value.TLabel", background="#101418", foreground="#55d6be", font=("Segoe UI", 11, "bold"))
+        style.configure("View.TLabel", background="#101418", foreground="#dbe4ea", font=("Segoe UI", 10, "bold"))
+        style.configure("View.TCombobox", fieldbackground="#202a31", background="#202a31", foreground="#dbe4ea")
+
+        top = ttk.Frame(self.root, style="Top.TFrame", padding=(20, 14, 20, 10))
+        top.pack(fill="x")
+        ttk.Label(top, text="LIDForge", style="Title.TLabel").pack(side="left")
+        ttk.Label(top, text="FOVEATED ROAD PERCEPTION", style="Meta.TLabel").pack(side="left", padx=(12, 0), pady=(4, 0))
+        self.latency_label = ttk.Label(top, text="Latency --", style="Value.TLabel")
+        self.latency_label.pack(side="right", padx=(18, 0))
+        self.status_label = ttk.Label(top, text="Initializing", style="Meta.TLabel")
+        self.status_label.pack(side="right")
+
+        controls = ttk.Frame(self.root, style="Top.TFrame", padding=(20, 0, 20, 10))
+        controls.pack(fill="x")
+        ttk.Label(controls, text="VIEW", style="View.TLabel").pack(side="left")
+        self.combo = ttk.Combobox(
+            controls,
+            textvariable=self.selected,
+            values=list(self.mode_by_name),
+            state="readonly",
+            width=22,
+            style="View.TCombobox",
+        )
+        self.combo.pack(side="left", padx=(10, 0))
+        self.combo.current(max(0, initial_mode - 1))
+        ttk.Label(controls, text="Select a view to inspect one output at a time", style="Meta.TLabel").pack(side="left", padx=(16, 0))
+
+        self.image_label = tk.Label(self.root, bg="#101418", bd=0, highlightthickness=0)
+        self.image_label.pack(fill="both", expand=True, padx=20, pady=(0, 16))
+        self.photo = None
+        self.root.update_idletasks()
+
+    def update(self):
+        if self.closed:
+            return None
+        try:
+            self.root.update()
+            return self.mode_by_name.get(self.selected.get(), 1)
+        except tk.TclError:
+            self.closed = True
+            return None
+
+    def show(self, image, latency_ms, status):
+        try:
+            self.root.update_idletasks()
+            available_w = max(320, self.image_label.winfo_width())
+            available_h = max(240, self.image_label.winfo_height())
+            source_h, source_w = image.shape[:2]
+            fit_scale = min(available_w / source_w, available_h / source_h)
+            fit_w = max(1, int(source_w * fit_scale))
+            fit_h = max(1, int(source_h * fit_scale))
+            fitted = cv2.resize(image, (fit_w, fit_h), interpolation=cv2.INTER_AREA)
+            display = np.full((available_h, available_w, 3), 16, dtype=np.uint8)
+            offset_x = (available_w - fit_w) // 2
+            offset_y = (available_h - fit_h) // 2
+            display[offset_y:offset_y + fit_h, offset_x:offset_x + fit_w] = fitted
+            ok, encoded = cv2.imencode(".png", display)
+            if not ok:
+                return
+            self.photo = tk.PhotoImage(data=base64.b64encode(encoded.tobytes()))
+            self.image_label.configure(image=self.photo)
+            self.latency_label.configure(text=f"Latency {latency_ms:.1f} ms")
+            self.status_label.configure(text=status)
+            self.root.update_idletasks()
+        except tk.TclError:
+            pass
+
+    def close(self):
+        self.closed = True
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
 # ==============================================================================
 # OPENCV DRAWING UTILITIES (ROUNDED BOXES & DISTANCE BADGES)
@@ -140,6 +301,21 @@ def emergency_cleanup():
     client = GLOBAL_CLEANUP_CONTEXT["client"]
     tm = GLOBAL_CLEANUP_CONTEXT["traffic_manager"]
     actors = GLOBAL_CLEANUP_CONTEXT["actors"]
+    walkthrough_writer = GLOBAL_CLEANUP_CONTEXT["walkthrough_writer"]
+    global SUMO_TRAFFIC, VIEW_SELECTOR, OUTPUT_SELECTOR
+
+    if SUMO_TRAFFIC is not None:
+        SUMO_TRAFFIC.close()
+        SUMO_TRAFFIC = None
+    if VIEW_SELECTOR is not None:
+        VIEW_SELECTOR.close()
+        VIEW_SELECTOR = None
+    if OUTPUT_SELECTOR is not None:
+        OUTPUT_SELECTOR.close()
+        OUTPUT_SELECTOR = None
+    if walkthrough_writer is not None:
+        walkthrough_writer.release()
+        GLOBAL_CLEANUP_CONTEXT["walkthrough_writer"] = None
 
     if world is not None:
         try:
@@ -180,6 +356,20 @@ def lidar_callback(sensor_data, data_queue):
     raw = np.frombuffer(sensor_data.raw_data, dtype=np.dtype('f4'))
     points = np.reshape(raw, (int(raw.shape[0] / 4), 4))
     data_queue.put(points)
+
+
+def camera_callback(sensor_data, data_queue):
+    """Convert a CARLA RGB camera frame to a BGR OpenCV image."""
+    raw = np.frombuffer(sensor_data.raw_data, dtype=np.uint8)
+    image = raw.reshape((sensor_data.height, sensor_data.width, 4))[:, :, :3]
+    try:
+        data_queue.put_nowait(image.copy())
+    except queue.Full:
+        try:
+            data_queue.get_nowait()
+            data_queue.put_nowait(image.copy())
+        except queue.Empty:
+            pass
 
 def update_spectator_follow_cam(spectator, vehicle):
     try:
@@ -332,11 +522,12 @@ def extract_elevation_features(xyz, preds):
     grid_dim = 140
     occ_grid = np.zeros((grid_dim, grid_dim), dtype=np.uint8)
 
-    dynamic_candidate_pts = (labels == 1) | (labels == 2) | (labels == 7) | ((labels == 4) & (h_local > 0.5) & (h_local < 2.0) & (np.abs(y) <= 3.6))
+    elevated_scene_pts = (h_local > 0.18) & (h_local < 2.8) & (x > 0.5) & (x < PERCEPTION_FORWARD_RANGE) & (np.abs(y) < PERCEPTION_LATERAL_RANGE)
+    dynamic_candidate_pts = (labels == 1) | (labels == 2) | (labels == 7) | elevated_scene_pts
     if np.any(dynamic_candidate_pts):
         ox = np.clip((x[dynamic_candidate_pts] / PERCEPTION_FORWARD_RANGE * (grid_dim - 1)).astype(np.int32), 0, grid_dim - 1)
         oy = np.clip(((y[dynamic_candidate_pts] + PERCEPTION_LATERAL_RANGE) / (2.0 * PERCEPTION_LATERAL_RANGE) * (grid_dim - 1)).astype(np.int32), 0, grid_dim - 1)
-        occ_grid[ox, oy] = 255
+        occ_grid[oy, ox] = 255
 
         num_labels, labels_im, stats, centroids = cv2.connectedComponentsWithStats(occ_grid, connectivity=8)
 
@@ -345,15 +536,15 @@ def extract_elevation_features(xyz, preds):
             if area < 3:
                 continue
 
-            cx_m = (centroids[i][1] / (grid_dim - 1)) * PERCEPTION_FORWARD_RANGE
-            cy_m = (centroids[i][0] / (grid_dim - 1)) * (2.0 * PERCEPTION_LATERAL_RANGE) - PERCEPTION_LATERAL_RANGE
+            cx_m = (centroids[i][0] / (grid_dim - 1)) * PERCEPTION_FORWARD_RANGE
+            cy_m = (centroids[i][1] / (grid_dim - 1)) * (2.0 * PERCEPTION_LATERAL_RANGE) - PERCEPTION_LATERAL_RANGE
 
             if abs(cy_m) > 4.2:
                 continue
 
             c_mask = dynamic_candidate_pts & (np.abs(x - cx_m) < 2.4) & (np.abs(y - cy_m) < 2.4)
             pts_count = np.count_nonzero(c_mask)
-            if pts_count < 10:
+            if pts_count < 6:
                 continue
 
             z_min_c = np.min(z[c_mask])
@@ -365,12 +556,21 @@ def extract_elevation_features(xyz, preds):
             dist_from_ego = math.hypot(cx_m, cy_m)
             bbox = (float(np.min(x[c_mask])), float(np.max(x[c_mask])), float(np.min(y[c_mask])), float(np.max(y[c_mask])))
 
-            if h_base > 0.16 or h_base < -0.22:
+            # Trees and poles are tall static structures, not vehicles, even when their
+            # canopy footprint overlaps a vehicle-sized cluster.
+            tree_like = (h_span > 2.2) or (h_span > 1.7 and (dx > 3.0 or dy > 2.4))
+            if tree_like:
                 labels[c_mask] = 4
-                continue
-
-            # Class 1: Real Vehicle
-            if (1.2 <= dx <= 6.5 and 0.7 <= dy <= 2.8 and 0.5 <= h_span <= 2.8) and pts_count >= 14:
+                clusters.append({
+                    "class_name": "Tree",
+                    "class": 4,
+                    "bbox": bbox,
+                    "pos": (cx_m, cy_m),
+                    "dist": dist_from_ego,
+                    "color": (0, 140, 255),
+                    "label": f"Tree: {dist_from_ego:.1f}m"
+                })
+            elif (1.0 <= dx <= 7.5 and 0.55 <= dy <= 3.4 and 0.35 <= h_span <= 2.2) and pts_count >= 8:
                 labels[c_mask] = 1
                 clusters.append({
                     "class_name": "Vehicle",
@@ -382,7 +582,7 @@ def extract_elevation_features(xyz, preds):
                     "label": f"Vehicle: {dist_from_ego:.1f}m"
                 })
             # Class 2: Pedestrian
-            elif (dx <= 1.4 and dy <= 1.4 and 0.75 <= h_span <= 2.2) and pts_count >= 8:
+            elif (dx <= 1.8 and dy <= 1.8 and 0.65 <= h_span <= 2.4) and pts_count >= 6:
                 labels[c_mask] = 2
                 clusters.append({
                     "class_name": "Pedestrian",
@@ -394,7 +594,7 @@ def extract_elevation_features(xyz, preds):
                     "label": f"Pedestrian: {dist_from_ego:.1f}m"
                 })
             # Class 7: Stray Animal / Low Profile Quadruped
-            elif (0.5 <= dx <= 1.8 and 0.3 <= dy <= 1.2 and 0.25 <= h_span <= 0.95) and pts_count >= 6:
+            elif (0.5 <= dx <= 2.0 and 0.3 <= dy <= 1.4 and 0.20 <= h_span <= 1.0) and pts_count >= 6:
                 labels[c_mask] = 7
                 clusters.append({
                     "class_name": "Animal",
@@ -405,7 +605,7 @@ def extract_elevation_features(xyz, preds):
                     "color": (0, 215, 255),
                     "label": f"Animal: {dist_from_ego:.1f}m"
                 })
-            elif dx >= 0.4 and dy >= 0.4 and h_span >= 0.35:
+            elif dx >= 0.25 and dy >= 0.25 and h_span >= 0.20:
                 labels[c_mask] = 4
                 clusters.append({
                     "class_name": "Obstacle",
@@ -419,6 +619,56 @@ def extract_elevation_features(xyz, preds):
 
     return labels, clusters
 
+
+def add_actor_fallback_clusters(world, ego_vehicle, clusters):
+    """Use CARLA actor geometry as a fallback label when LiDAR returns are sparse."""
+    ego_tf = ego_vehicle.get_transform()
+    yaw = math.radians(ego_tf.rotation.yaw)
+    cos_yaw = math.cos(yaw)
+    sin_yaw = math.sin(yaw)
+
+    actors = list(world.get_actors().filter("vehicle.*")) + list(world.get_actors().filter("walker.pedestrian.*"))
+    for actor in actors:
+        if actor.id == ego_vehicle.id or not actor.is_alive:
+            continue
+        location = actor.get_location()
+        dx = location.x - ego_tf.location.x
+        dy = location.y - ego_tf.location.y
+        forward = dx * cos_yaw + dy * sin_yaw
+        lateral = -dx * sin_yaw + dy * cos_yaw
+        if not (0.5 < forward < 48.0 and abs(lateral) < 24.0):
+            continue
+
+        is_pedestrian = actor.type_id.startswith("walker.pedestrian")
+        class_id = 2 if is_pedestrian else 1
+        class_name = "Pedestrian" if is_pedestrian else "Vehicle"
+        color = (0, 0, 255) if is_pedestrian else (255, 140, 0)
+        extent = actor.bounding_box.extent
+        length = max(0.35, extent.x * 2.0)
+        width = max(0.30, extent.y * 2.0)
+        height = max(1.0, extent.z * 2.0)
+        duplicate = any(
+            c["class"] == class_id and math.hypot(c["pos"][0] - forward, c["pos"][1] - lateral) < 2.5
+            for c in clusters
+        )
+        if duplicate:
+            continue
+
+        distance = math.hypot(forward, lateral)
+        clusters.append({
+            "class_name": class_name,
+            "class": class_id,
+            "bbox": (forward - length / 2.0, forward + length / 2.0, lateral - width / 2.0, lateral + width / 2.0),
+            "pos": (forward, lateral),
+            "dist": distance,
+            "color": color,
+            "label": f"{class_name}: {distance:.1f}m",
+            "source": "carla_actor_fallback",
+            "height": height,
+        })
+
+    return clusters
+
 # ==============================================================================
 # SAFE-WAYPOINT TACTICAL GUIDANCE
 # ==============================================================================
@@ -427,6 +677,59 @@ class TacticalGuidanceController:
         self.stall_counter = 0
         self.last_pos = None
         self.is_autopilot = True
+        self.avoid_ticks = 0
+        self.avoid_steer = 0.0
+        self.avoid_direction = ""
+        self.stop_sign_id = None
+        self.stop_wait_started = None
+        self.passed_stop_signs = set()
+
+    @staticmethod
+    def _adjacent_driving_lanes(vehicle, world_map):
+        transform = vehicle.get_transform()
+        waypoint = world_map.get_waypoint(
+            transform.location,
+            project_to_road=True,
+            lane_type=carla.LaneType.Driving,
+        )
+        if waypoint is None:
+            return []
+        yaw = math.radians(transform.rotation.yaw)
+        lanes = []
+        for side, lane_waypoint in ((-1, waypoint.get_left_lane()), (1, waypoint.get_right_lane())):
+            if lane_waypoint is None or lane_waypoint.lane_type != carla.LaneType.Driving:
+                continue
+            if lane_waypoint.road_id != waypoint.road_id:
+                continue
+            if waypoint.lane_id != 0 and lane_waypoint.lane_id != 0:
+                if (waypoint.lane_id > 0) != (lane_waypoint.lane_id > 0):
+                    continue
+            dx = lane_waypoint.transform.location.x - transform.location.x
+            dy = lane_waypoint.transform.location.y - transform.location.y
+            lateral = -dx * math.sin(yaw) + dy * math.cos(yaw)
+            lanes.append((side, lane_waypoint, lateral))
+        return lanes
+
+    def _stop_sign_ahead(self, vehicle, world):
+        transform = vehicle.get_transform()
+        yaw = math.radians(transform.rotation.yaw)
+        cos_yaw = math.cos(yaw)
+        sin_yaw = math.sin(yaw)
+        candidates = list(world.get_actors().filter("traffic.stop*"))
+        nearest = None
+        nearest_distance = float("inf")
+        for sign in candidates:
+            if sign.id in self.passed_stop_signs or not sign.is_alive:
+                continue
+            location = sign.get_location()
+            dx = location.x - transform.location.x
+            dy = location.y - transform.location.y
+            forward = dx * cos_yaw + dy * sin_yaw
+            lateral = -dx * sin_yaw + dy * cos_yaw
+            if 0.0 < forward < 14.0 and abs(lateral) < 5.0 and forward < nearest_distance:
+                nearest = sign
+                nearest_distance = forward
+        return nearest, nearest_distance
 
     def update(self, vehicle, traffic_manager, world_map, clusters, labels, xyz):
         v_tf = vehicle.get_transform()
@@ -476,21 +779,95 @@ class TacticalGuidanceController:
                 self.stall_counter = max(0, self.stall_counter - 1)
         self.last_pos = v_loc
 
-        # Emergency Stop (< 4.5m)
-        if fwd_threat is not None and fwd_threat["dist"] < 4.5:
+        stop_sign, stop_distance = self._stop_sign_ahead(vehicle, vehicle.get_world())
+        if stop_sign is not None:
+            if self.stop_sign_id != stop_sign.id:
+                self.stop_sign_id = stop_sign.id
+                self.stop_wait_started = None
+            if self.stop_wait_started is None:
+                self.stop_wait_started = time.monotonic()
+            waited = time.monotonic() - self.stop_wait_started
+            if stop_distance < 8.0 and waited < 2.0:
+                if self.is_autopilot:
+                    vehicle.set_autopilot(False)
+                    self.is_autopilot = False
+                vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
+                return "STOP SIGN: WAITING", (0, 0, 255), tl_state_str, tl_color, f"RELEASE IN {max(0.0, 2.0 - waited):.1f}s", (0, 220, 255)
+            if waited >= 2.0:
+                self.passed_stop_signs.add(stop_sign.id)
+                self.stop_sign_id = None
+                self.stop_wait_started = None
+                if not self.is_autopilot:
+                    vehicle.set_autopilot(True, traffic_manager.get_port())
+                    self.is_autopilot = True
+                return "STOP SIGN: PROCEEDING", (0, 255, 0), tl_state_str, tl_color, "2s WAIT COMPLETE", (0, 255, 0)
+
+        if self.avoid_ticks > 0:
+            target_side = -1 if self.avoid_steer < 0 else 1
+            if not any(side == target_side for side, _, _ in self._adjacent_driving_lanes(vehicle, world_map)):
+                self.avoid_ticks = 0
+                vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.9, steer=0.0))
+                return "BYPASS STOP: LANE ENDED", (0, 0, 255), tl_state_str, tl_color, "NO SAFE DRIVING LANE", (0, 0, 255)
+            self.avoid_ticks -= 1
             if self.is_autopilot:
                 vehicle.set_autopilot(False)
                 self.is_autopilot = False
-            vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.95, steer=0.0))
-            return f"CRITICAL: {fwd_threat['label']}", (0, 0, 255), tl_state_str, tl_color, "ZERO-TOLERANCE BRAKE", (0, 0, 255)
+            vehicle.apply_control(carla.VehicleControl(throttle=0.16, brake=0.1, steer=self.avoid_steer))
+            return "BYPASSING: ALTERNATE LANE", (0, 165, 255), tl_state_str, tl_color, f"OVERTAKE {self.avoid_direction}", (0, 220, 255)
+
+        # Brake early for vulnerable road users and commit to a clear alternate lane.
+        if fwd_threat is not None and fwd_threat["dist"] < 8.0:
+            if self.is_autopilot:
+                vehicle.set_autopilot(False)
+                self.is_autopilot = False
+            dynamic_mask = np.isin(labels, (1, 2, 7))
+            left_clear = np.count_nonzero(dynamic_mask & (xyz[:, 0] > 1.0) & (xyz[:, 0] < 14.0) & (xyz[:, 1] > 1.0) & (xyz[:, 1] < 3.8))
+            right_clear = np.count_nonzero(dynamic_mask & (xyz[:, 0] > 1.0) & (xyz[:, 0] < 14.0) & (xyz[:, 1] < -1.0) & (xyz[:, 1] > -3.8))
+            left_cluster = any(c["class"] in (1, 2, 7) and 1.0 < c["pos"][0] < 14.0 and 1.0 < c["pos"][1] < 3.8 for c in clusters)
+            right_cluster = any(c["class"] in (1, 2, 7) and 1.0 < c["pos"][0] < 14.0 and -3.8 < c["pos"][1] < -1.0 for c in clusters)
+            left_blocked = left_clear >= 5 or left_cluster
+            right_blocked = right_clear >= 5 or right_cluster
+            if fwd_threat["dist"] < 4.0 or (left_blocked and right_blocked):
+                vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
+                return f"CRITICAL: {fwd_threat['label']}", (0, 0, 255), tl_state_str, tl_color, "EMERGENCY BRAKE", (0, 0, 255)
+            preferred_side = -1 if not left_blocked else 1
+            if not any(side == preferred_side for side, _, _ in self._adjacent_driving_lanes(vehicle, world_map)):
+                vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, steer=0.0))
+                return f"CRITICAL: {fwd_threat['label']}", (0, 0, 255), tl_state_str, tl_color, "NO SAFE DRIVING LANE", (0, 0, 255)
+            self.avoid_steer = 0.48 * preferred_side
+            self.avoid_direction = "RIGHT" if preferred_side > 0 else "LEFT"
+            self.avoid_ticks = 18
+            vehicle.apply_control(carla.VehicleControl(throttle=0.12, brake=0.2, steer=self.avoid_steer))
+            return f"AVOIDING: {fwd_threat['label']}", (0, 140, 255), tl_state_str, tl_color, f"OVERTAKE {self.avoid_direction}", (0, 220, 255)
 
         # Deadlock Bypass (> 25 ticks)
         if self.stall_counter > 25:
             if self.is_autopilot:
                 vehicle.set_autopilot(False)
                 self.is_autopilot = False
-            vehicle.apply_control(carla.VehicleControl(throttle=0.35, brake=0.0, steer=-0.38))
-            return "TACTIC: DEADLOCK BYPASS OVERRIDE", (0, 165, 255), tl_state_str, tl_color, "ALTERNATE ROUTE OVERRIDE", (0, 165, 255)
+            valid_sides = self._adjacent_driving_lanes(vehicle, world_map)
+
+            if valid_sides:
+                # Prefer the side with the largest LiDAR clearance, but never leave a driving lane.
+                side_scores = []
+                for side, _, lane_lateral in valid_sides:
+                    clearance = np.count_nonzero(
+                        (xyz[:, 0] > 2.0) & (xyz[:, 0] < 12.0) &
+                        (np.sign(xyz[:, 1]) == np.sign(lane_lateral)) &
+                        (np.abs(xyz[:, 1] - lane_lateral) < 1.5)
+                    )
+                    side_scores.append((clearance, side))
+                _, chosen_side = max(side_scores, key=lambda item: item[0])
+                steer = 0.24 * chosen_side
+                direction = "RIGHT" if chosen_side > 0 else "LEFT"
+                vehicle.apply_control(carla.VehicleControl(throttle=0.12, brake=0.2, steer=steer))
+                self.stall_counter = 0
+                return "TACTIC: DRIVING-LANE BYPASS", (0, 165, 255), tl_state_str, tl_color, f"LANE CHANGE {direction}", (0, 165, 255)
+
+            # No adjacent driving lane: remain on the road and wait for the blockage to clear.
+            vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=0.85, steer=0.0))
+            self.stall_counter = 0
+            return "TACTIC: WAITING FOR CLEARANCE", (0, 165, 255), tl_state_str, tl_color, "NO SAFE DRIVING LANE", (0, 165, 255)
 
         # Reactive Lateral Swerve
         if fwd_threat is not None:
@@ -527,13 +904,17 @@ def draw_ego_vehicle_icon(canvas, cx, cy):
 def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
                                  tl_text, tl_col, tactic_text, tactic_col,
                                  fps, latency_dict, ego_speed, num_pts,
-                                 canvas_w=1600, canvas_h=930):
+                                 view_mode=0, canvas_w=1600, canvas_h=930):
     canvas = np.full((canvas_h, canvas_w, 3), 16, dtype=np.uint8)
 
     # 1. Header Section
     draw_text(canvas, "LIDForge", (30, 48), 1.35, (255, 180, 50), 2, cv2.FONT_HERSHEY_DUPLEX)
     draw_text(canvas, " - Output Visualization", (225, 48), 1.15, (235, 235, 235), 2, cv2.FONT_HERSHEY_DUPLEX)
     draw_text(canvas, "Range-aware base grid + scene-adaptive refinement", (32, 78), 0.52, (170, 170, 170), 1)
+    view_names = {1: "LIDAR", 2: "GRID", 3: "HEIGHT MAP", 4: "TELEMETRY"}
+    view_mode = view_mode if view_mode in view_names else 1
+    draw_text(canvas, f"VIEW: {view_names[view_mode]}", (560, 48), 0.48, (0, 215, 255), 1)
+    draw_text(canvas, f"LATENCY: {latency_dict.get('total', 0.0):.1f} ms", (560, 76), 0.48, (0, 255, 0), 1)
 
     draw_rounded_rect(canvas, (820, 16), (1180, 88), (24, 24, 24), radius=5, thickness=-1)
     draw_rounded_rect(canvas, (820, 16), (1180, 88), (55, 55, 55), radius=5, thickness=1)
@@ -803,19 +1184,459 @@ def render_ss_matching_dashboard(xyz, labels, clusters, status_text, status_col,
     draw_text(canvas, f"OCCUPANCY & GATING: {latency_dict.get('gating', 1.8):.1f} ms", (c3_x1 + 320, pe_y1 + 188), 0.38, (200, 200, 200), 1)
     draw_text(canvas, f"DASHBOARD BLIT:     {latency_dict.get('render', 4.1):.1f} ms", (c3_x1 + 320, pe_y1 + 208), 0.38, (200, 200, 200), 1)
 
+    if view_mode in (1, 2, 3):
+        panel_x = {1: (pa_x1, pa_x2), 2: (pb_x1, pb_x2), 3: (pc_x1, pc_x2)}[view_mode]
+        selected = canvas[top_y:p_y2, panel_x[0]:panel_x[1]]
+        selected_header = np.full((54, selected.shape[1], 3), 16, dtype=np.uint8)
+        draw_text(selected_header, f"VIEW: {view_names[view_mode]}   |   LATENCY: {latency_dict.get('total', 0.0):.1f} ms", (16, 34), 0.52, (0, 215, 255), 1)
+        return cv2.resize(np.vstack((selected_header, selected)), (canvas_w, canvas_h), interpolation=cv2.INTER_LINEAR)
+    if view_mode == 4:
+        selected = canvas[pe_y1:pe_y2, pe_x1:pe_x2]
+        selected_header = np.full((54, selected.shape[1], 3), 16, dtype=np.uint8)
+        draw_text(selected_header, f"VIEW: {view_names[view_mode]}   |   LATENCY: {latency_dict.get('total', 0.0):.1f} ms", (16, 34), 0.52, (0, 215, 255), 1)
+        return cv2.resize(np.vstack((selected_header, selected)), (canvas_w, canvas_h), interpolation=cv2.INTER_LINEAR)
+    return canvas
+
+
+def render_fresh_dashboard(xyz, labels, clusters, status_text, status_col,
+                           tl_text, tl_col, tactic_text, tactic_col,
+                           fps, latency_dict, ego_speed, num_pts,
+                           view_mode=1, canvas_w=1200, canvas_h=650):
+    """Render the new single-view dashboard without the legacy panel layout."""
+    canvas = np.full((canvas_h, canvas_w, 3), (14, 18, 22), dtype=np.uint8)
+    header_h = 68
+    rail_w = 300
+    main_x1, main_x2 = 22, canvas_w - rail_w - 12
+    main_y1, main_y2 = header_h + 16, canvas_h - 20
+    view_names = {1: "LiDAR", 2: "Grid", 3: "Height Map", 4: "Telemetry"}
+    view_name = view_names.get(view_mode, "LiDAR")
+
+    draw_text(canvas, "LIDForge", (24, 34), 0.82, (245, 185, 70), 2, cv2.FONT_HERSHEY_DUPLEX)
+    draw_text(canvas, view_name.upper(), (178, 33), 0.48, (220, 230, 235), 1, cv2.FONT_HERSHEY_DUPLEX)
+    draw_text(canvas, f"{status_text}", (24, 57), 0.38, status_col, 1)
+    draw_text(canvas, f"LATENCY  {latency_dict.get('total', 0.0):.1f} ms", (canvas_w - 250, 29), 0.42, (76, 220, 177), 1)
+    draw_text(canvas, f"{fps:.1f} FPS", (canvas_w - 115, 51), 0.34, (150, 165, 175), 1)
+
+    draw_rounded_rect(canvas, (main_x1, main_y1), (main_x2, main_y2), (19, 25, 30), radius=8, thickness=-1)
+    draw_rounded_rect(canvas, (main_x1, main_y1), (main_x2, main_y2), (45, 58, 65), radius=8, thickness=1)
+    draw_rounded_rect(canvas, (main_x2 + 12, main_y1), (canvas_w - 14, main_y2), (19, 25, 30), radius=8, thickness=-1)
+    draw_rounded_rect(canvas, (main_x2 + 12, main_y1), (canvas_w - 14, main_y2), (45, 58, 65), radius=8, thickness=1)
+
+    view_x1, view_x2 = main_x1 + 16, main_x2 - 16
+    view_y1, view_y2 = main_y1 + 42, main_y2 - 16
+    draw_text(canvas, view_name, (view_x1, main_y1 + 27), 0.46, (210, 220, 225), 1)
+
+    if view_mode == 1:
+        cx, cy = (view_x1 + view_x2) // 2, view_y2 - 12
+        scale = min((view_x2 - view_x1) / 48.0, (view_y2 - view_y1) / 55.0)
+        for distance in (10, 20, 30, 40):
+            radius = int(distance * scale)
+            cv2.ellipse(canvas, (cx, cy), (radius // 2, radius), 0, 180, 360, (45, 58, 64), 1)
+            draw_text(canvas, f"{distance}m", (cx + 7, cy - radius + 12), 0.30, (100, 115, 123), 1)
+        for lateral in (-12, -6, 0, 6, 12):
+            x_end = int(cx + lateral * scale)
+            draw_line(canvas, (cx, cy), (x_end, view_y1), (35, 47, 53), 1)
+        visible = (xyz[:, 0] > 0.5) & (xyz[:, 0] < 48.0) & (np.abs(xyz[:, 1]) < 24.0)
+        if np.any(visible):
+            px = np.clip((cx + xyz[visible, 1] * scale).astype(np.int32), view_x1, view_x2)
+            py = np.clip((cy - xyz[visible, 0] * scale).astype(np.int32), view_y1, view_y2)
+            point_labels = labels[visible]
+            for class_id, color in ((3, (45, 170, 95)), (1, (60, 165, 245)), (2, (55, 80, 240)), (6, (220, 70, 210))):
+                mask = point_labels == class_id
+                canvas[py[mask], px[mask]] = color
+            other = ~np.isin(point_labels, (1, 2, 3, 6))
+            canvas[py[other], px[other]] = (185, 195, 205)
+        draw_ego_vehicle_icon(canvas, cx, cy)
+    elif view_mode == 2:
+        cell = max(12, min((view_x2 - view_x1) // 24, (view_y2 - view_y1) // 28))
+        origin_x = (view_x1 + view_x2) // 2
+        origin_y = view_y2 - 12
+        for row in range(24):
+            for col in range(-12, 13):
+                x1 = origin_x + col * cell
+                y1 = origin_y - (row + 1) * cell
+                if x1 < view_x1 or x1 + cell > view_x2 or y1 < view_y1:
+                    continue
+                draw_rect(canvas, (x1, y1), (x1 + cell - 1, y1 + cell - 1), (31, 42, 47), 1)
+        if len(xyz):
+            in_view = (xyz[:, 0] > 0.0) & (xyz[:, 0] < 48.0) & (np.abs(xyz[:, 1]) < 24.0)
+            for x_val, y_val, label in zip(xyz[in_view, 0], xyz[in_view, 1], labels[in_view]):
+                col = int(y_val / 2.0)
+                row = int(x_val / 2.0)
+                color = (45, 170, 95) if label == 3 else (60, 165, 245) if label == 1 else (55, 80, 240) if label == 2 else (185, 195, 205)
+                x1 = origin_x + col * cell
+                y1 = origin_y - (row + 1) * cell
+                if view_x1 <= x1 < view_x2 and view_y1 <= y1 < view_y2:
+                    draw_rect(canvas, (x1, y1), (x1 + cell - 2, y1 + cell - 2), color, -1)
+        draw_ego_vehicle_icon(canvas, origin_x, origin_y)
+    elif view_mode == 3:
+        map_w, map_h = view_x2 - view_x1, view_y2 - view_y1
+        height_map = np.full((map_h, map_w), -2.5, dtype=np.float32)
+        valid = (xyz[:, 0] > 0.0) & (xyz[:, 0] < 48.0) & (np.abs(xyz[:, 1]) < 24.0)
+        if np.any(valid):
+            gx = np.clip((view_x1 + (xyz[valid, 1] + 24.0) / 48.0 * (map_w - 1)).astype(np.int32), view_x1, view_x2 - 1)
+            gy = np.clip((view_y2 - (xyz[valid, 0] / 48.0 * (map_h - 1))).astype(np.int32), view_y1, view_y2 - 1)
+            np.maximum.at(height_map, (gy - view_y1, gx - view_x1), xyz[valid, 2])
+        normalized = np.clip(((height_map + 2.5) / 5.5 * 255.0), 0, 255).astype(np.uint8)
+        height_color = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+        height_color[height_map <= -2.4] = (19, 25, 30)
+        canvas[view_y1:view_y2, view_x1:view_x2] = height_color
+        draw_text(canvas, "LOW", (view_x1 + 8, view_y2 - 10), 0.30, (180, 190, 195), 1)
+        draw_text(canvas, "HIGH", (view_x2 - 42, view_y1 + 16), 0.30, (245, 245, 245), 1)
+    else:
+        metrics = [
+            ("EGO SPEED", f"{ego_speed:.1f} km/h", (80, 220, 190)),
+            ("POINTS", f"{num_pts:,}", (220, 230, 235)),
+            ("OBJECTS", str(len(clusters)), (245, 185, 70)),
+            ("SIGNAL", tl_text, tl_col),
+            ("TACTIC", tactic_text, tactic_col),
+        ]
+        y = view_y1 + 44
+        for title, value, color in metrics:
+            draw_text(canvas, title, (view_x1 + 30, y), 0.34, (125, 140, 148), 1)
+            draw_text(canvas, value, (view_x1 + 30, y + 31), 0.65, color, 1)
+            draw_line(canvas, (view_x1 + 30, y + 48), (view_x2 - 30, y + 48), (45, 58, 65), 1)
+            y += 78
+
+    draw_text(canvas, "DETECTIONS", (main_x2 + 30, main_y1 + 30), 0.40, (125, 140, 148), 1)
+    if not clusters:
+        draw_text(canvas, "No objects in range", (main_x2 + 30, main_y1 + 70), 0.40, (150, 165, 172), 1)
+    else:
+        y = main_y1 + 70
+        for cluster in sorted(clusters, key=lambda item: item.get("dist", 999.0))[:7]:
+            draw_circle(canvas, (main_x2 + 38, y - 5), 5, cluster.get("color", (185, 195, 205)), -1)
+            draw_text(canvas, cluster.get("class_name", "Object"), (main_x2 + 52, y), 0.38, (220, 230, 235), 1)
+            draw_text(canvas, f"{cluster.get('dist', 0.0):.1f} m", (main_x2 + 52, y + 20), 0.36, (105, 220, 185), 1)
+            y += 55
+    draw_text(canvas, "LIVE", (canvas_w - 60, canvas_h - 22), 0.32, (80, 220, 190), 1)
+    return canvas
+
+
+def render_reference_dashboard(xyz, labels, clusters, status_text, status_col,
+                               tl_text, tl_col, tactic_text, tactic_col,
+                               fps, latency_dict, ego_speed, num_pts,
+                               view_mode=1, canvas_w=1200, canvas_h=650):
+    """Render the reference-inspired monochrome operations dashboard."""
+    canvas = np.full((canvas_h, canvas_w, 3), (15, 15, 15), dtype=np.uint8)
+    line_color = (145, 145, 145)
+    text_color = (215, 215, 215)
+    muted = (155, 155, 155)
+    accent = (195, 195, 195)
+    green = (90, 220, 155)
+    font = cv2.FONT_HERSHEY_PLAIN
+    mode_names = {1: "BEV View", 2: "Foveated Grid", 3: "Elevation Map", 4: "Telemetry"}
+    selected_name = mode_names.get(view_mode, "BEV View")
+
+    def box(x1, y1, x2, y2):
+        draw_rect(canvas, (x1, y1), (x2, y2), line_color, 1)
+
+    def label(text, x, y, size=1.0, color=text_color):
+        draw_text(canvas, text, (x, y), size, color, 1, font)
+
+    box(22, 12, canvas_w - 22, canvas_h - 12)
+    label("ADAPTIVE 2.5D LiDAR MAPPING", 34, 39, 1.15, text_color)
+    label("Dynamic Environment Perception", 34, 60, 1.0, muted)
+    draw_circle(canvas, (canvas_w - 180, 35), 4, green, -1)
+    label("LIVE", canvas_w - 166, 39, 1.0, text_color)
+    label(f"FPS {fps:.0f}", canvas_w - 92, 39, 1.0, text_color)
+    label(f"LAT {latency_dict.get('total', 0.0):.1f}ms", canvas_w - 166, 60, 0.9, green)
+    draw_line(canvas, (22, 72), (canvas_w - 22, 72), line_color, 1)
+
+    left_x1, left_x2 = 22, 250
+    center_x1, center_x2 = 250, 810
+    right_x1, right_x2 = 810, canvas_w - 22
+    top_y, bottom_y = 72, 458
+    for x in (left_x1, left_x2, center_x1, center_x2, right_x1, right_x2):
+        draw_line(canvas, (x, top_y), (x, bottom_y), line_color, 1)
+    draw_line(canvas, (22, bottom_y), (canvas_w - 22, bottom_y), line_color, 1)
+
+    label("FOVEATED GRID", 35, 103, 1.05, text_color)
+    label("Zone 0", 35, 143, 1.0, text_color)
+    label("0-10m (5cm)", 35, 164, 0.95, muted)
+    label("Zone 1", 35, 207, 1.0, text_color)
+    label("10-30m (15cm)", 35, 228, 0.95, muted)
+    label("Zone 2", 35, 271, 1.0, text_color)
+    label("30-100m (50cm)", 35, 292, 0.95, muted)
+    label("Density Bar", 35, 337, 1.0, text_color)
+    for idx in range(6):
+        draw_rect(canvas, (35 + idx * 9, 350), (43 + idx * 9, 366), (80 + idx * 25,) * 3, -1)
+    label("5cm", 99, 365, 0.9, muted)
+    label("Objects", 35, 407, 1.0, text_color)
+    label(f"{len(clusters):02d} detected", 35, 428, 0.95, green)
+
+    label(selected_name.upper(), center_x1 + 22, 103, 1.05, text_color)
+    label("Selected output", center_x1 + 22, 124, 0.9, muted)
+    view_x1, view_x2 = center_x1 + 22, center_x2 - 22
+    view_y1, view_y2 = 140, 438
+
+    if view_mode == 1:
+        # Fill the complete rectangular BEV viewport: lateral -24..24 m, forward 0..48 m.
+        draw_rect(canvas, (view_x1, view_y1), (view_x2, view_y2), (20, 31, 39), -1)
+        draw_rect(canvas, (view_x1, view_y1), (view_x2, view_y2), (55, 150, 145), 1)
+        cx, cy = (view_x1 + view_x2) // 2, view_y2 - 1
+        x_scale = (view_x2 - view_x1) / 48.0
+        y_scale = (view_y2 - view_y1) / 48.0
+        for lateral in (-18, -12, -6, 0, 6, 12, 18):
+            grid_x = int(cx + lateral * x_scale)
+            draw_line(canvas, (grid_x, view_y1), (grid_x, view_y2), (30, 68, 72), 1)
+        for forward in (6, 12, 18, 24, 30, 36, 42):
+            grid_y = int(cy - forward * y_scale)
+            draw_line(canvas, (view_x1, grid_y), (view_x2, grid_y), (30, 68, 72), 1)
+        for distance in (10, 20, 30, 40):
+            cv2.ellipse(canvas, (cx, cy), (int(distance * x_scale), int(distance * y_scale)), 0, 180, 360, (48, 120, 120), 1)
+            draw_text(canvas, f"{distance}m", (view_x1 + 7, int(cy - distance * y_scale + 13)), 0.30, (130, 190, 185), 1, font)
+        draw_text(canvas, "FORWARD", (view_x1 + 8, view_y1 + 18), 0.32, (130, 190, 185), 1, font)
+        visible = (xyz[:, 0] > 0.5) & (xyz[:, 0] < 48.0) & (np.abs(xyz[:, 1]) < 24.0)
+        if np.any(visible):
+            px = np.clip((view_x1 + (xyz[visible, 1] + 24.0) * x_scale).astype(np.int32), view_x1, view_x2 - 1)
+            py = np.clip((cy - xyz[visible, 0] * y_scale).astype(np.int32), view_y1, view_y2 - 1)
+            point_labels = labels[visible]
+            for class_id, color in ((3, (70, 185, 115)), (1, (50, 170, 245)), (2, (65, 75, 245)), (6, (220, 85, 210)), (7, (40, 205, 230))):
+                mask = point_labels == class_id
+                canvas[py[mask], px[mask]] = color
+            unknown = ~np.isin(point_labels, (1, 2, 3, 6, 7))
+            canvas[py[unknown], px[unknown]] = (160, 185, 190)
+        draw_ego_vehicle_icon(canvas, cx, cy)
+    elif view_mode == 2:
+        for x in range(view_x1, view_x2, 24):
+            draw_line(canvas, (x, view_y1), (x, view_y2), (45, 45, 45), 1)
+        for y in range(view_y1, view_y2, 24):
+            draw_line(canvas, (view_x1, y), (view_x2, y), (45, 45, 45), 1)
+        for point, point_label in zip(xyz, labels):
+            if 0 < point[0] < 48 and abs(point[1]) < 24:
+                px = int((view_x1 + view_x2) / 2 + point[1] * 10)
+                py = int(view_y2 - point[0] * 6)
+                if view_x1 <= px < view_x2 and view_y1 <= py < view_y2:
+                    color = (100, 190, 120) if point_label == 3 else (100, 180, 245)
+                    draw_rect(canvas, (px, py), (px + 5, py + 5), color, -1)
+    elif view_mode == 3:
+        map_h, map_w = view_y2 - view_y1, view_x2 - view_x1
+        height_map = np.full((map_h, map_w), -2.5, dtype=np.float32)
+        valid = (xyz[:, 0] > 0) & (xyz[:, 0] < 48) & (np.abs(xyz[:, 1]) < 24)
+        if np.any(valid):
+            gx = np.clip(((xyz[valid, 1] + 24) / 48 * (map_w - 1)).astype(np.int32), 0, map_w - 1)
+            gy = np.clip(((1 - xyz[valid, 0] / 48) * (map_h - 1)).astype(np.int32), 0, map_h - 1)
+            np.maximum.at(height_map, (gy, gx), xyz[valid, 2])
+        height_color = cv2.applyColorMap(np.clip((height_map + 2.5) / 5.5 * 255, 0, 255).astype(np.uint8), cv2.COLORMAP_TURBO)
+        height_color[height_map <= -2.4] = (15, 15, 15)
+        canvas[view_y1:view_y2, view_x1:view_x2] = height_color
+    else:
+        label("PROCESSING", view_x1 + 28, view_y1 + 42, 0.95, muted)
+        label(f"{latency_dict.get('gating', 0.0):.1f} ms", view_x1 + 28, view_y1 + 76, 1.5, green)
+        label("POINT CLOUD", view_x1 + 210, view_y1 + 42, 0.95, muted)
+        label(f"{num_pts:,}", view_x1 + 210, view_y1 + 76, 1.5, accent)
+        label("EGO SPEED", view_x1 + 28, view_y1 + 142, 0.95, muted)
+        label(f"{ego_speed:.1f} km/h", view_x1 + 28, view_y1 + 176, 1.5, accent)
+        label("TACTIC", view_x1 + 210, view_y1 + 142, 0.95, muted)
+        label(tactic_text[:24], view_x1 + 210, view_y1 + 176, 0.9, tactic_col)
+
+    label("SYSTEM PERFORMANCE", right_x1 + 22, 103, 1.05, text_color)
+    performance = [
+        ("Memory", "runtime"),
+        ("Processing", f"{latency_dict.get('total', 0.0):.1f} ms"),
+        ("Render Rate", f"{fps:.0f} FPS"),
+        ("Signal", tl_text),
+        ("Tactic", tactic_text[:20]),
+    ]
+    y = 143
+    for title, value in performance:
+        label(f"{title}:", right_x1 + 22, y, 0.95, muted)
+        label(value, right_x1 + 125, y, 0.95, green if title in ("Processing", "Render Rate") else text_color)
+        y += 37
+    label("DETECTIONS BY DISTANCE", right_x1 + 22, 340, 0.95, text_color)
+    if clusters:
+        y = 370
+        for cluster in sorted(clusters, key=lambda item: item.get("dist", 999))[:3]:
+            label(f"{cluster.get('class_name', 'Object')[:12]:12} {cluster.get('dist', 0.0):5.1f}m", right_x1 + 22, y, 0.9, cluster.get("color", accent))
+            y += 22
+    else:
+        label("No objects in range", right_x1 + 22, 370, 0.9, muted)
+
+    pipeline_y = 478
+    box(22, pipeline_y, canvas_w - 22, 520)
+    label("PIPELINE:", 35, 504, 0.95, text_color)
+    label("RAW LiDAR  ->  AI SEGMENTATION  ->  FOVEATED GRID  ->  2.5D MAP", 115, 504, 0.95, muted)
+    box(22, 520, canvas_w - 22, canvas_h - 12)
+    tab_width = (canvas_w - 44) // 3
+    tabs = (("BEV View", 1), ("Elevation Map", 3), ("Raw LiDAR", 2))
+    for index, (tab, tab_mode) in enumerate(tabs):
+        x = 35 + index * tab_width
+        color = green if view_mode == tab_mode else text_color
+        label(tab, x + 35, 553, 1.0, color)
+    label("Dropdown controls active view", canvas_w - 230, 590, 0.82, muted)
+    return canvas
+
+
+def render_simple_opencv_output(xyz, labels, clusters, latency_ms, fps,
+                                canvas_w=1200, canvas_h=700, output_mode=1):
+    """Render only the LiDAR BEV, object labels, and top latency strip."""
+    canvas = np.full((canvas_h, canvas_w, 3), (12, 12, 12), dtype=np.uint8)
+    header_h = 54
+    view_x1, view_x2 = 24, canvas_w - 24
+    view_y1, view_y2 = header_h + 18, canvas_h - 24
+    draw_rect(canvas, (view_x1, view_y1), (view_x2, view_y2), (20, 20, 20), -1)
+    draw_rect(canvas, (view_x1, view_y1), (view_x2, view_y2), (170, 190, 190), 1)
+    draw_text(canvas, "LIDForge  |  LiDAR OUTPUT", (24, 34), 0.78, (235, 235, 235), 2, cv2.FONT_HERSHEY_DUPLEX)
+    draw_text(canvas, f"LATENCY  {latency_ms:.1f} ms", (canvas_w - 260, 29), 0.58, (85, 225, 180), 1, cv2.FONT_HERSHEY_SIMPLEX)
+    draw_text(canvas, f"{fps:.1f} FPS", (canvas_w - 110, 48), 0.38, (155, 175, 180), 1)
+
+    if output_mode == 2:
+        map_w, map_h = view_x2 - view_x1, view_y2 - view_y1
+        height_map = np.full((map_h, map_w), -2.5, dtype=np.float32)
+        visible = (xyz[:, 0] > 0.0) & (xyz[:, 0] < 48.0) & (np.abs(xyz[:, 1]) < 24.0)
+        if np.any(visible):
+            gx = np.clip(((xyz[visible, 1] + 24.0) / 48.0 * (map_w - 1)).astype(np.int32), 0, map_w - 1)
+            gy = np.clip(((1.0 - xyz[visible, 0] / 48.0) * (map_h - 1)).astype(np.int32), 0, map_h - 1)
+            np.maximum.at(height_map, (gy, gx), xyz[visible, 2])
+        normalized = np.clip((height_map + 2.5) / 5.5 * 255.0, 0, 255).astype(np.uint8)
+        rendered = cv2.applyColorMap(normalized, cv2.COLORMAP_TURBO)
+        rendered[height_map <= -2.4] = (20, 20, 20)
+        canvas[view_y1:view_y2, view_x1:view_x2] = rendered
+        ego_x = (view_x1 + view_x2) // 2
+        ego_y = view_y2 - 12
+        draw_rounded_rect(canvas, (ego_x - 14, ego_y - 25), (ego_x + 14, ego_y + 3), (255, 215, 0), radius=5, thickness=-1)
+        draw_rect(canvas, (ego_x - 7, ego_y - 19), (ego_x + 7, ego_y - 8), (30, 30, 30), -1)
+        draw_text(canvas, "HEIGHT MAP", (view_x1 + 12, view_y1 + 24), 0.52, (255, 255, 255), 1)
+        draw_text(canvas, "LOW", (view_x1 + 12, view_y2 - 10), 0.36, (255, 255, 255), 1)
+        draw_text(canvas, "HIGH", (view_x2 - 48, view_y1 + 22), 0.36, (255, 255, 255), 1)
+        legend_x = view_x2 - 24
+        legend_y = view_y1 + 35
+        for index in range(80):
+            color = cv2.applyColorMap(np.array([[255 - index * 3]], dtype=np.uint8), cv2.COLORMAP_TURBO)[0, 0].tolist()
+            draw_rect(canvas, (legend_x, legend_y + index * 3), (legend_x + 12, legend_y + index * 3 + 3), color, -1)
+        draw_text(canvas, "m", (legend_x - 2, legend_y - 8), 0.30, (255, 255, 255), 1)
+        return canvas
+
+    if output_mode == 3:
+        grid_w, grid_h = 24, 24
+        center_x = (view_x1 + view_x2) // 2
+        bottom_y = view_y2 - 30
+        cell_px = max(12, min((view_x2 - view_x1 - 80) // grid_w, 30))
+        depth_x, depth_y = max(4, cell_px // 4), max(5, cell_px // 3)
+        height_grid = np.full((grid_h, grid_w), -2.5, dtype=np.float32)
+        class_grid = np.zeros((grid_h, grid_w), dtype=np.int32)
+        visible = (xyz[:, 0] > 0.0) & (xyz[:, 0] < 48.0) & (np.abs(xyz[:, 1]) < 24.0)
+        if np.any(visible):
+            selected = xyz[visible]
+            selected_labels = labels[visible]
+            cols = np.clip(((selected[:, 1] + 24.0) / 48.0 * grid_w).astype(np.int32), 0, grid_w - 1)
+            rows = np.clip(((1.0 - selected[:, 0] / 48.0) * grid_h).astype(np.int32), 0, grid_h - 1)
+            order = np.argsort(selected[:, 2])
+            for index in order:
+                height_grid[rows[index], cols[index]] = selected[index, 2]
+                class_grid[rows[index], cols[index]] = selected_labels[index]
+        palette = {0: (25, 25, 25), 1: (255, 140, 0), 2: (0, 0, 255), 3: (34, 139, 34), 4: (0, 140, 255), 5: (255, 255, 0), 6: (255, 0, 255), 7: (0, 215, 255)}
+        for row in range(grid_h):
+            for col in range(grid_w):
+                base_x = center_x + (col - grid_w // 2) * cell_px + (row - grid_h // 2) * depth_x
+                base_y = bottom_y - (grid_h - 1 - row) * depth_y
+                ground = np.array([[base_x, base_y], [base_x + cell_px, base_y], [base_x + cell_px - depth_x, base_y - depth_y], [base_x - depth_x, base_y - depth_y]], dtype=np.int32)
+                height = max(0.0, float(height_grid[row, col]) + 1.85) if height_grid[row, col] > -2.4 else 0.0
+                lift = min(105, int(height * 25.0))
+                top = ground.copy()
+                top[:, 1] -= lift
+                color = palette.get(class_grid[row, col], (160, 160, 160))
+                side_color = tuple(max(0, value // 2) for value in color)
+                cv2.fillConvexPoly(canvas, np.array([ground[0], ground[1], top[1], top[0]], dtype=np.int32), side_color)
+                cv2.fillConvexPoly(canvas, np.array([ground[1], ground[2], top[2], top[1]], dtype=np.int32), side_color)
+                cv2.fillConvexPoly(canvas, top, color)
+                cv2.polylines(canvas, [top], True, (55, 55, 55), 1, cv2.LINE_AA)
+        ego_x = center_x + (grid_w // 2 - grid_w // 2) * cell_px + (grid_h - 1 - grid_h // 2) * depth_x
+        ego_y = bottom_y - 4
+        draw_rounded_rect(canvas, (ego_x - 10, ego_y - 24), (ego_x + 10, ego_y), (0, 215, 255), radius=4, thickness=2)
+        draw_text(canvas, "2.5D GRID", (view_x1 + 12, view_y1 + 24), 0.52, (235, 235, 235), 1)
+        draw_text(canvas, "HEIGHT (m)", (view_x2 - 92, view_y1 + 24), 0.34, (235, 235, 235), 1)
+        legend = (("ROAD", palette[3]), ("VEHICLE", palette[1]), ("PEDESTRIAN", palette[2]), ("POTHOLE", palette[6]))
+        for index, (name, color) in enumerate(legend):
+            lx = view_x1 + 12 + index * 125
+            draw_rect(canvas, (lx, view_y2 - 22), (lx + 10, view_y2 - 12), color, -1)
+            draw_text(canvas, name, (lx + 15, view_y2 - 13), 0.30, (235, 235, 235), 1)
+        return canvas
+
+    if output_mode == 4:
+        draw_text(canvas, "TELEMETRY", (view_x1 + 32, view_y1 + 55), 0.65, (235, 235, 235), 1)
+        metrics = (("POINTS PLOTTED", f"{len(xyz):,}"), ("OBJECTS", str(len(clusters))), ("LATENCY", f"{latency_ms:.1f} ms"), ("FRAME RATE", f"{fps:.1f} FPS"))
+        y = view_y1 + 115
+        for name, value in metrics:
+            draw_text(canvas, name, (view_x1 + 32, y), 0.42, (155, 155, 155), 1)
+            draw_text(canvas, value, (view_x1 + 300, y), 0.72, (80, 220, 170), 1)
+            y += 70
+        return canvas
+
+    center_x = (view_x1 + view_x2) // 2
+    bottom_y = view_y2 - 1
+    x_scale = (view_x2 - view_x1) / 48.0
+    y_scale = (bottom_y - view_y1) / 48.0
+    range_scale = min(x_scale, y_scale)
+    for distance in (10, 20, 30, 40):
+        radius = int(distance * range_scale)
+        cv2.circle(canvas, (center_x, bottom_y), radius, (90, 90, 90), 1, cv2.LINE_AA)
+        draw_text(canvas, f"{distance}m", (center_x + 7, bottom_y - radius + 13), 0.34, (180, 180, 180), 1)
+    for lateral in (-18, -12, -6, 0, 6, 12, 18):
+        grid_x = int(center_x + lateral * x_scale)
+        draw_line(canvas, (grid_x, view_y1), (grid_x, bottom_y), (45, 45, 45), 1)
+    draw_text(canvas, "TOP-DOWN LiDAR", (view_x1 + 10, view_y1 + 22), 0.40, (200, 200, 200), 1)
+    colors = {
+        1: (255, 140, 0),
+        2: (0, 0, 255),
+        3: (34, 139, 34),
+        4: (0, 140, 255),
+        5: (255, 255, 0),
+        6: (255, 0, 255),
+        7: (0, 215, 255),
+    }
+
+    visible = (xyz[:, 0] > 0.0) & (xyz[:, 0] < 48.0) & (np.abs(xyz[:, 1]) < 24.0)
+    if np.any(visible):
+        selected = xyz[visible]
+        px = np.clip((center_x + selected[:, 1] * x_scale).astype(np.int32), view_x1, view_x2 - 1)
+        py = np.clip((bottom_y - selected[:, 0] * y_scale).astype(np.int32), view_y1, bottom_y)
+        point_labels = labels[visible]
+        for class_id, color in colors.items():
+            mask = point_labels == class_id
+            canvas[py[mask], px[mask]] = color
+        unknown = ~np.isin(point_labels, tuple(colors))
+        canvas[py[unknown], px[unknown]] = (160, 185, 190)
+
+    draw_rounded_rect(canvas, (center_x - 10, bottom_y - 24), (center_x + 10, bottom_y - 2), (0, 215, 255), radius=4, thickness=2)
+    for cluster in sorted(clusters, key=lambda item: item.get("dist", 999.0)):
+        xmin, xmax, ymin, ymax = cluster.get("bbox", (
+            cluster["pos"][0] - 0.8, cluster["pos"][0] + 0.8,
+            cluster["pos"][1] - 0.8, cluster["pos"][1] + 0.8,
+        ))
+        bx1 = int(center_x + ymin * x_scale)
+        bx2 = int(center_x + ymax * x_scale)
+        by1 = int(bottom_y - xmax * y_scale)
+        by2 = int(bottom_y - xmin * y_scale)
+        bx1, bx2 = sorted((max(view_x1, bx1), min(view_x2 - 1, bx2)))
+        by1, by2 = sorted((max(view_y1, by1), min(bottom_y, by2)))
+        if bx2 - bx1 < 18:
+            bx1 = max(view_x1, bx1 - 9)
+            bx2 = min(view_x2 - 1, bx2 + 9)
+        if by2 - by1 < 18:
+            by1 = max(view_y1, by1 - 9)
+            by2 = min(bottom_y, by2 + 9)
+        color = cluster.get("color", colors.get(cluster.get("class", 0), (185, 195, 205)))
+        draw_rounded_rect(canvas, (bx1, by1), (bx2, by2), color, radius=6, thickness=2)
+        label_text = cluster.get("label", f"Object: {cluster.get('dist', 0.0):.1f}m")
+        draw_classification_badge(canvas, label_text, bx1, max(view_y1 + 22, by1 - 3), color)
+    draw_text(canvas, f"OBJECTS  {len(clusters)}", (view_x1 + 12, canvas_h - 7), 0.38, (155, 175, 180), 1)
     return canvas
 
 # ==============================================================================
 # MAIN SIMULATION & SENSOR BRIDGE (TOWN10 ENFORCED)
 # ==============================================================================
 def main():
-    global IS_RUNNING, WORLD_POTHOLE_LOCATIONS
+    global IS_RUNNING, WORLD_POTHOLE_LOCATIONS, SUMO_TRAFFIC, VIEW_SELECTOR, OUTPUT_SELECTOR
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(f"[+] Initializing LIDForge Master Client on: {torch.cuda.get_device_name(0)}")
 
-    window_name = "LIDForge - Output Visualization (Multi-Resolution 2.5D Perception)"
+    window_name = "LIDForge - LiDAR Output"
     cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, 1600, 930)
+    cv2.resizeWindow(window_name, 1100, 700)
+    walkthrough_enabled = os.environ.get("LIDFORGE_WALKTHROUGH", "0").lower() in ("1", "true", "yes", "on")
+    if not walkthrough_enabled:
+        OUTPUT_SELECTOR = OutputModeSelector()
 
     # 1. Instantiate Weather Conditioning Filter
     weather_filter = WeatherConditioningFilter(min_intensity=0.08)
@@ -830,6 +1651,9 @@ def main():
     model.eval()
 
     tactical_planner = TacticalGuidanceController()
+    view_mode = 1
+    actor_fallback_cache = []
+    actor_fallback_frame = -3
 
     # 2. Connect to CARLA Server & Target Town10
     client = carla.Client("127.0.0.1", 2000)
@@ -839,8 +1663,8 @@ def main():
     world = client.get_world()
     active_map = world.get_map().name
 
-    if "Town10" not in active_map:
-        print(f"[!] Current map is {active_map}. Switching to Town10HD_Opt...")
+    if TARGET_CARLA_MAP not in active_map:
+        print(f"[!] Current map is {active_map}. Switching to {TARGET_CARLA_MAP}...")
         try:
             curr_s = world.get_settings()
             if curr_s.synchronous_mode:
@@ -850,10 +1674,12 @@ def main():
         except Exception:
             pass
 
-        world = client.load_world("Town10HD_Opt")
+        world = client.load_world(TARGET_CARLA_MAP)
         time.sleep(3.0)
         world = client.get_world()
         active_map = world.get_map().name
+        if TARGET_CARLA_MAP not in active_map:
+            raise RuntimeError(f"CARLA loaded unexpected map: {active_map}")
         print(f"[✓] Active map verified: {active_map}")
     else:
         print(f"[✓] CARLA verified active on: {active_map}")
@@ -908,10 +1734,22 @@ def main():
     fy = math.sin(v_init_yaw)
 
     WORLD_POTHOLE_LOCATIONS = [
-        (v_init_tf.location.x + fx * 20.0, v_init_tf.location.y + fy * 20.0, 0.85, 0.15),
-        (v_init_tf.location.x + fx * 40.0, v_init_tf.location.y + fy * 40.0, 0.90, 0.16),
-        (v_init_tf.location.x + fx * 65.0, v_init_tf.location.y + fy * 65.0, 0.80, 0.14)
+        (v_init_tf.location.x + fx * 12.0, v_init_tf.location.y + fy * 12.0, 1.10, 0.24),
+        (v_init_tf.location.x + fx * 24.0, v_init_tf.location.y + fy * 24.0, 1.10, 0.24),
+        (v_init_tf.location.x + fx * 38.0, v_init_tf.location.y + fy * 38.0, 1.00, 0.22)
     ]
+
+    # SUMO owns ambient traffic; CARLA remains the synchronous sensor/rendering master.
+    if os.environ.get("LIDFORGE_SUMO", "1").lower() not in ("0", "false", "off"):
+        SUMO_TRAFFIC = SumoIndianTraffic(client, world, anchor_location=v_init_tf.location)
+        if SUMO_TRAFFIC.start():
+            SUMO_TRAFFIC.spawn_jaywalkers(vehicle, count=20)
+    elif walkthrough_enabled:
+        from traffic_generator import spawn_active_forward_crossers, spawn_ambient_indian_traffic
+        fallback_traffic_manager = client.get_trafficmanager(8000)
+        fallback_actors = spawn_ambient_indian_traffic(world, fallback_traffic_manager, num_vehicles=16)
+        fallback_actors.extend(spawn_active_forward_crossers(world, vehicle, num_pedestrians=12))
+        GLOBAL_CLEANUP_CONTEXT["actors"].extend(fallback_actors)
 
     # 7. Attach 64-Channel LiDAR Sensor (30,000 points per 20 Hz frame)
     lidar_bp = bp_lib.find("sensor.lidar.ray_cast")
@@ -929,13 +1767,54 @@ def main():
     lidar_queue = queue.Queue(maxsize=10)
     lidar.listen(lambda data: lidar_callback(data, lidar_queue))
 
+    camera_queue = queue.Queue(maxsize=3)
+    camera = None
+    walkthrough_writer = None
+    walkthrough_dir = None
+    walkthrough_fallback_actors = []
+    walkthrough_started = time.monotonic()
+    next_screenshot = 0.0
+    if walkthrough_enabled:
+        walkthrough_dir = Path("walkthrough_output")
+        walkthrough_dir.mkdir(exist_ok=True)
+        camera_bp = bp_lib.find("sensor.camera.rgb")
+        camera_bp.set_attribute("image_size_x", "800")
+        camera_bp.set_attribute("image_size_y", "450")
+        camera_bp.set_attribute("fov", "100")
+        camera_tf = carla.Transform(carla.Location(x=1.4, y=0.0, z=2.2), carla.Rotation(pitch=-8.0))
+        camera = world.spawn_actor(camera_bp, camera_tf, attach_to=vehicle)
+        GLOBAL_CLEANUP_CONTEXT["actors"].append(camera)
+        camera.listen(lambda data: camera_callback(data, camera_queue))
+        walkthrough_writer = cv2.VideoWriter(
+            str(walkthrough_dir / "lidforge_walkthrough.mp4"),
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            WALKTHROUGH_VIDEO_FPS,
+            (1600, 700),
+        )
+        if not walkthrough_writer.isOpened():
+            raise RuntimeError("Could not open walkthrough video writer.")
+        GLOBAL_CLEANUP_CONTEXT["walkthrough_writer"] = walkthrough_writer
+        print(f"[+] Walkthrough recording enabled: {walkthrough_dir.resolve()}")
+
     print("[+] Master Perception Loop Active in Town10. Ready.")
 
     frame_idx = 0
     try:
         while IS_RUNNING:
             t0 = time.perf_counter()
+            elapsed_walkthrough = time.monotonic() - walkthrough_started
+            if walkthrough_enabled and elapsed_walkthrough >= WALKTHROUGH_DURATION_SECONDS:
+                print("[✓] Walkthrough duration complete.")
+                break
+            if OUTPUT_SELECTOR is not None:
+                output_mode = OUTPUT_SELECTOR.update()
+                if output_mode is None:
+                    break
+            elif walkthrough_enabled:
+                output_mode = 1 + int(elapsed_walkthrough // WALKTHROUGH_PANEL_SECONDS) % 4
             world.tick()
+            if SUMO_TRAFFIC is not None:
+                SUMO_TRAFFIC.step()
             weather_index = update_dynamic_weather(
                 world,
                 world.get_snapshot().timestamp.elapsed_seconds,
@@ -955,6 +1834,11 @@ def main():
                     if cv2.waitKey(1) & 0xFF in [ord('q'), ord('Q'), 27]:
                         break
                     continue
+
+            camera_frame = None
+            if walkthrough_enabled:
+                while not camera_queue.empty():
+                    camera_frame = camera_queue.get_nowait()
 
             # Strip ego vehicle chassis returns
             xyz = points[:, :3].copy()
@@ -994,13 +1878,20 @@ def main():
             intensity_valid = intensity_sub[u_idx]
             t_dedup = (time.perf_counter() - t_dedup_0) * 1000.0
 
-            coords_x = (xyz_valid[:, 0] / voxel_size).astype(np.int32)
-            coords_y = ((xyz_valid[:, 1] + PERCEPTION_LATERAL_RANGE) / voxel_size).astype(np.int32)
-            coords_z = ((xyz_valid[:, 2] - PERCEPTION_Z_MIN) / voxel_size).astype(np.int32)
+            if len(xyz_valid) > MODEL_POINTS_PER_FRAME:
+                model_idx = np.linspace(0, len(xyz_valid) - 1, MODEL_POINTS_PER_FRAME, dtype=np.int32)
+            else:
+                model_idx = np.arange(len(xyz_valid), dtype=np.int32)
+            xyz_model = xyz_valid[model_idx]
+            intensity_model = intensity_valid[model_idx]
+
+            coords_x = (xyz_model[:, 0] / voxel_size).astype(np.int32)
+            coords_y = ((xyz_model[:, 1] + PERCEPTION_LATERAL_RANGE) / voxel_size).astype(np.int32)
+            coords_z = ((xyz_model[:, 2] - PERCEPTION_Z_MIN) / voxel_size).astype(np.int32)
             coords_b = np.stack([np.zeros(len(coords_x), dtype=np.int32), coords_x, coords_y, coords_z], axis=-1)
 
             t_coords = torch.from_numpy(coords_b).to(device=device, dtype=torch.int32).contiguous()
-            t_feats = torch.from_numpy(intensity_valid).to(device=device, dtype=torch.float32).contiguous()
+            t_feats = torch.from_numpy(intensity_model).to(device=device, dtype=torch.float32).contiguous()
 
             x_sp = spconv.SparseConvTensor(
                 features=t_feats,
@@ -1017,12 +1908,19 @@ def main():
             t_sp_0 = time.perf_counter()
             with torch.inference_mode(), torch.amp.autocast('cuda'):
                 logits = model(x_sp)
-                raw_preds = torch.argmax(logits, dim=-1).cpu().numpy()
+                sampled_preds = torch.argmax(logits, dim=-1).cpu().numpy()
+            raw_preds = np.full(len(xyz_valid), 4, dtype=np.int64)
+            raw_preds[model_idx[:len(sampled_preds)]] = sampled_preds
             t_sp = (time.perf_counter() - t_sp_0) * 1000.0
 
             # Dynamic Object Clustering with Real-Time Classification & Distance Tags
             t_gate_0 = time.perf_counter()
             fused_labels, clusters = extract_elevation_features(xyz_valid, raw_preds)
+            if frame_idx - actor_fallback_frame >= 3:
+                actor_fallback_cache = add_actor_fallback_clusters(world, vehicle, clusters)
+                actor_fallback_frame = frame_idx
+            else:
+                clusters = clusters + [dict(cluster) for cluster in actor_fallback_cache if cluster.get("source") == "carla_actor_fallback"]
             t_gate = (time.perf_counter() - t_gate_0) * 1000.0
 
             # Tactical Guidance
@@ -1049,17 +1947,42 @@ def main():
 
             # Render Dashboard with Rounded Boxes & Distance Badges
             t_ren_0 = time.perf_counter()
-            dashboard = render_ss_matching_dashboard(
-                xyz_valid, fused_labels, clusters,
-                status_text, status_col, tl_text, tl_col, tactic_text, tactic_col,
-                fps, latency_dict, speed, num_pts
+            window_rect = cv2.getWindowImageRect(window_name)
+            display_w = max(720, int(window_rect[2]))
+            display_h = max(480, int(window_rect[3]))
+            dashboard = render_simple_opencv_output(
+                xyz_valid, fused_labels, clusters, total_latency, fps,
+                canvas_w=display_w, canvas_h=display_h, output_mode=output_mode
             )
             latency_dict["render"] = (time.perf_counter() - t_ren_0) * 1000.0
 
-            cv2.imshow(window_name, dashboard)
+            if walkthrough_enabled:
+                combined = np.full((700, 1600, 3), (12, 12, 12), dtype=np.uint8)
+                dashboard_video = cv2.resize(dashboard, (960, 700), interpolation=cv2.INTER_AREA)
+                combined[:, 640:1600] = dashboard_video
+                if camera_frame is not None:
+                    camera_video = cv2.resize(camera_frame, (640, 360), interpolation=cv2.INTER_AREA)
+                    camera_y = (700 - 360) // 2
+                    combined[camera_y:camera_y + 360, :640] = camera_video
+                draw_text(combined, "CARLA SIMULATOR", (18, 32), 0.62, (235, 235, 235), 1, cv2.FONT_HERSHEY_DUPLEX)
+                draw_text(combined, f"WALKTHROUGH  |  VIEW {output_mode}/4", (18, 58), 0.42, (85, 225, 180), 1)
+                cv2.line(combined, (639, 0), (639, 700), (110, 110, 110), 1)
+                walkthrough_writer.write(combined)
+                if elapsed_walkthrough >= next_screenshot:
+                    screenshot_path = walkthrough_dir / f"frame_{int(elapsed_walkthrough):03d}s.png"
+                    cv2.imwrite(str(screenshot_path), combined)
+                    next_screenshot += 5.0
 
+            if frame_idx % 30 == 0:
+                print(
+                    f"[PERF] frame={frame_idx} latency={total_latency:.1f}ms "
+                    f"points={len(xyz_valid):,} spconv={t_sp:.1f}ms "
+                    f"gating={t_gate:.1f}ms render={latency_dict['render']:.1f}ms"
+                )
+
+            cv2.imshow(window_name, dashboard)
             key = cv2.waitKey(1) & 0xFF
-            if key in [ord('q'), ord('Q'), 27]:
+            if key in (ord('q'), ord('Q'), 27):
                 break
             if frame_idx > 5 and cv2.getWindowProperty(window_name, cv2.WND_PROP_VISIBLE) < 1:
                 break
@@ -1067,6 +1990,9 @@ def main():
     except Exception as e:
         print(f"[!] Master runtime exception: {e}")
     finally:
+        if walkthrough_writer is not None:
+            walkthrough_writer.release()
+            GLOBAL_CLEANUP_CONTEXT["walkthrough_writer"] = None
         emergency_cleanup()
 
 if __name__ == "__main__":
